@@ -36,10 +36,14 @@ Swap host ownership, rename players, transfer worlds between machines, share wor
 - **Sender flow** — click **Share**, get a 6-character code, and share it with the receiver
 - **Receiver flow** — enter the code, choose where to save the ZIP, and the world transfers directly from the sender's PC
 - **Progress tracking** — real-time progress bar and status messages for both sender and receiver
-
 - **Auto-import** — received worlds are automatically extracted and presented for import into your game
+- **Metered.ca TURN relay** — integrated [Metered.ca](https://www.metered.ca/) TURN support for reliable connections across NAT/CGNAT/mobile networks (free tier: 50 GB/month)
+- **TURN test button** — one-click connectivity test that verifies relay candidates are reachable before transferring
+- **ICE debug logging** — connection state, ICE gathering state, and signaling state changes are logged to the activity console
+- **Copy API key** — one-click copy button to easily share your Metered API key with friends
+- **Credential persistence** — Metered domain and API key are saved in localStorage and restored automatically on next launch
 
-> Note: Some home/mobile networks use strict NAT/CGNAT that blocks direct WebRTC connections. In those cases, a TURN relay is required (see TURN config below).
+> **Important:** P2P transfers require a TURN relay to work across different networks. Each user must create a free [Metered.ca](https://www.metered.ca/signup) account and enter their credentials in the app before sharing or receiving worlds. See [P2P TURN Configuration](#-p2p-turn-configuration) below.
 
 ### Backup System
 
@@ -74,6 +78,7 @@ Swap host ownership, rename players, transfer worlds between machines, share wor
 | **Compression** | `zip` crate (Rust)        | World export/import as `.zip`                         |
 | **File walk**   | `walkdir` crate           | Recursive directory traversal for export              |
 | **P2P**         | PeerJS (WebRTC)           | Direct peer-to-peer world transfer between PCs        |
+| **TURN relay**  | Metered.ca API            | TURN credentials for NAT traversal (free 50 GB/month) |
 
 ---
 
@@ -185,22 +190,33 @@ This starts both the Vite dev server (with HMR) and the Tauri native window.
 
 ---
 
-## 🔌 P2P TURN / ICE Configuration
+## 🔌 P2P TURN Configuration
 
-If P2P transfers time out between different networks, configure a TURN relay.
-You can set TURN in the app UI (P2P Transfer section), or via Vite environment variables:
+P2P world transfers require a **TURN relay** to work reliably across different networks (NAT, CGNAT, mobile data, etc.). The app uses [Metered.ca](https://www.metered.ca/) as TURN provider.
+
+### Setup (required for each user)
+
+1. **Create a free account** at [metered.ca/signup](https://www.metered.ca/signup) — the free plan includes **50 GB/month**
+2. In your Metered dashboard, copy your **App Domain** (e.g. `yourapp.metered.live`) and **API Key**
+3. Open the app → expand **P2P Transfer** in the sidebar → paste your domain and API key
+4. Click **Save** — credentials are stored locally and persist across sessions
+5. Click **Test TURN** to verify connectivity (you should see `TURN relay OK`)
+
+Once configured, you can use the **copy button** next to the API key field to share your credentials with a friend who plays on the same Metered account.
+
+> **Note:** Share and Receive buttons are disabled until valid Metered credentials are configured.
+
+### Advanced: self-hosted coturn
+
+If you prefer to self-host, you can also configure a custom coturn server via environment variables:
 
 ```bash
-# Optional: JSON array of RTCIceServer objects
-VITE_P2P_ICE_SERVERS='[{"urls":"stun:stun.l.google.com:19302"}]'
-
-# Optional: TURN (recommended for real-world transfers)
-VITE_P2P_TURN_URL='turn:your-turn-host:3478?transport=udp,turn:your-turn-host:3478?transport=tcp'
-VITE_P2P_TURN_USERNAME='your-username'
-VITE_P2P_TURN_CREDENTIAL='your-password'
+# Custom TURN server (coturn with use-auth-secret)
+VITE_P2P_TURN_URL='turn:your-host:3478?transport=udp,turn:your-host:3478?transport=tcp'
+VITE_P2P_TURN_SECRET='your-shared-secret'
 ```
 
-If you self-host, `coturn` is the usual choice. Make sure UDP 3478 is open; keep TCP as fallback.
+The app generates ephemeral HMAC-SHA1 credentials from the shared secret automatically.
 
 ### Build for Production
 
@@ -253,6 +269,8 @@ Double-click either installer to install the app. It will appear in your Start M
 | Missing permissions in production build                     | Tauri v2 capabilities not configured for events, webview, and dialog in production             | Added `core:event`, `core:webview`, and `dialog` permissions to `capabilities/default.json`       |
 | Exported ZIP too large                                      | All backup history included in export                                                          | Only the most recent backup subfolder is included; older ones are skipped                         |
 | Rescan doesn't detect deleted worlds                        | Rescan only refreshed accounts, didn't cascade re-fetch worlds/players/backups                 | Rescan now fully re-loads accounts → worlds → players → backups from disk                         |
+| P2P transfer times out between different networks           | Only STUN servers configured; STUN fails with symmetric NAT / CGNAT / mobile networks          | Integrated Metered.ca TURN relay with automatic credential fetching and 10-min caching            |
+| P2P fails silently with no relay candidates                 | Free Open Relay Project servers had invalid/expired credentials                                | Replaced with Metered.ca API; each user configures their own account; Test TURN button to verify  |
 
 ---
 
