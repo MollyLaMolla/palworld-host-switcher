@@ -36,7 +36,10 @@ Swap host ownership, rename players, transfer worlds between machines, share wor
 - **Sender flow** — click **Share**, get a 6-character code, and share it with the receiver
 - **Receiver flow** — enter the code, choose where to save the ZIP, and the world transfers directly from the sender's PC
 - **Progress tracking** — real-time progress bar and status messages for both sender and receiver
+
 - **Auto-import** — received worlds are automatically extracted and presented for import into your game
+
+> Note: Some home/mobile networks use strict NAT/CGNAT that blocks direct WebRTC connections. In those cases, a TURN relay is required (see TURN config below).
 
 ### Backup System
 
@@ -179,6 +182,25 @@ npx tauri dev
 ```
 
 This starts both the Vite dev server (with HMR) and the Tauri native window.
+
+---
+
+## 🔌 P2P TURN / ICE Configuration
+
+If P2P transfers time out between different networks, configure a TURN relay.
+You can set TURN in the app UI (P2P Transfer section), or via Vite environment variables:
+
+```bash
+# Optional: JSON array of RTCIceServer objects
+VITE_P2P_ICE_SERVERS='[{"urls":"stun:stun.l.google.com:19302"}]'
+
+# Optional: TURN (recommended for real-world transfers)
+VITE_P2P_TURN_URL='turn:your-turn-host:3478?transport=udp,turn:your-turn-host:3478?transport=tcp'
+VITE_P2P_TURN_USERNAME='your-username'
+VITE_P2P_TURN_CREDENTIAL='your-password'
+```
+
+If you self-host, `coturn` is the usual choice. Make sure UDP 3478 is open; keep TCP as fallback.
 
 ### Build for Production
 

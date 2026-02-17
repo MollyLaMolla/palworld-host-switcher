@@ -284,6 +284,7 @@
 
 select,
 input[type="text"],
+input[type="password"],
 .search {
   background: var(--bg-input);
   border: 1px solid var(--border);
@@ -1171,6 +1172,29 @@ button:hover:not(:disabled) {
 }
 
 /* ── P2P Transfer ──────────────────────────────────────── */
+
+.p2p-settings {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  background: var(--bg-surface);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  margin: 6px 0 10px;
+}
+
+.p2p-settings__row {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+.p2p-settings__row input {
+  flex: 1;
+  min-width: 0;
+  font-size: 0.76rem;
+}
 
 .p2p-receive-row {
   display: flex;

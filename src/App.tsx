@@ -34,6 +34,9 @@ import {
   startSending,
   startReceiving,
   cancelP2P,
+  testIceServers,
+  fetchMeteredCredentials,
+  isMeteredConfigured,
   type P2PStatus,
 } from "./services/p2pService";
 
@@ -429,6 +432,12 @@ function App() {
   const [p2pReceiveCode, setP2pReceiveCode] = useState("");
   const [p2pCopied, setP2pCopied] = useState(false);
   const [p2pTempZip, setP2pTempZip] = useState<string | null>(null);
+  const [p2pMeteredDomain, setP2pMeteredDomain] = useState("");
+  const [p2pMeteredApiKey, setP2pMeteredApiKey] = useState("");
+  const [p2pTestStatus, setP2pTestStatus] = useState<
+    "idle" | "testing" | "ok" | "warn" | "error"
+  >("idle");
+  const [p2pTestMessage, setP2pTestMessage] = useState("");
 
   /* ── World name editing ────────────────────────────── */
   const [editingWorldName, setEditingWorldName] = useState(false);
@@ -609,6 +618,17 @@ function App() {
       setAccounts(items);
       setAccountId(items[0] ?? "");
     });
+  }, []);
+
+  useEffect(() => {
+    try {
+      const domain = localStorage.getItem("p2p.meteredDomain") ?? "";
+      const apiKey = localStorage.getItem("p2p.meteredApiKey") ?? "";
+      setP2pMeteredDomain(domain);
+      setP2pMeteredApiKey(apiKey);
+    } catch {
+      // ignore storage errors
+    }
   }, []);
 
   useEffect(() => {
@@ -1285,6 +1305,7 @@ function App() {
           setP2pCode(code);
           pushLog(`P2P: Code generated: ${code}`);
         },
+        onDebug: (message) => pushLog(`P2P ICE: ${message}`),
       });
 
       pushLog("P2P: World sent successfully!");
@@ -1338,6 +1359,7 @@ function App() {
           if (status === "error") pushLog(`P2P: Error — ${message}`);
         },
         onProgress: (pct) => setP2pProgress(pct),
+        onDebug: (message) => pushLog(`P2P ICE: ${message}`),
       });
 
       pushLog(`P2P: World received and saved to ${dest}`);
@@ -1374,8 +1396,75 @@ function App() {
     }
   };
 
+  const handleSaveP2PSettings = () => {
+    const domain = p2pMeteredDomain.trim();
+    const apiKey = p2pMeteredApiKey.trim();
+    if (!domain || !apiKey) {
+      pushToast("Both Metered domain and API key are required.", "info");
+      return;
+    }
+    try {
+      localStorage.setItem("p2p.meteredDomain", domain);
+      localStorage.setItem("p2p.meteredApiKey", apiKey);
+      // Remove legacy keys
+      localStorage.removeItem("p2p.turnUrls");
+      localStorage.removeItem("p2p.turnSecret");
+      localStorage.removeItem("p2p.turnUsername");
+      localStorage.removeItem("p2p.turnCredential");
+      pushToast("Metered TURN credentials saved.", "success");
+      pushLog("P2P: Metered credentials saved.");
+    } catch {
+      pushToast("Failed to save P2P settings.", "error");
+    }
+  };
+
+  const handleClearP2PSettings = () => {
+    try {
+      localStorage.removeItem("p2p.meteredDomain");
+      localStorage.removeItem("p2p.meteredApiKey");
+      localStorage.removeItem("p2p.turnUrls");
+      localStorage.removeItem("p2p.turnSecret");
+      localStorage.removeItem("p2p.turnUsername");
+      localStorage.removeItem("p2p.turnCredential");
+      setP2pMeteredDomain("");
+      setP2pMeteredApiKey("");
+      pushToast("P2P settings cleared.", "info");
+      pushLog("P2P: Metered credentials cleared.");
+    } catch {
+      pushToast("Failed to clear P2P settings.", "error");
+    }
+  };
+
+  const handleTestP2P = async () => {
+    setP2pTestStatus("testing");
+    setP2pTestMessage("Fetching TURN credentials…");
+    pushLog("P2P: Fetching Metered TURN credentials…");
+    try {
+      const creds = await fetchMeteredCredentials();
+      pushLog(`P2P: Got ${creds.length} ICE server(s) from Metered.`);
+      setP2pTestMessage("Testing relay connectivity…");
+      const result = await testIceServers();
+      if (result.relayFound) {
+        setP2pTestStatus("ok");
+        setP2pTestMessage(`TURN relay OK (${result.summary})`);
+        pushLog(`P2P: TURN relay OK (${result.summary})`);
+      } else {
+        setP2pTestStatus("warn");
+        setP2pTestMessage(`No relay candidates (${result.summary})`);
+        pushLog(`P2P: No relay candidates (${result.summary})`);
+      }
+    } catch (err) {
+      setP2pTestStatus("error");
+      setP2pTestMessage(`Test failed: ${err}`);
+      pushLog(`P2P: Test failed — ${err}`);
+    }
+  };
+
   const p2pBusy =
     p2pStatus !== "idle" && p2pStatus !== "done" && p2pStatus !== "error";
+  const p2pConfigured = isMeteredConfigured();
+  const p2pHasMeteredFields =
+    p2pMeteredDomain.trim().length > 0 || p2pMeteredApiKey.trim().length > 0;
 
   const playerOptions = players.map((player) => (
     <option key={player.id} value={player.id}>
@@ -1701,6 +1790,99 @@ function App() {
                   server needed — data travels directly between PCs.
                 </p>
 
+                <div className="p2p-settings">
+                  <span className="transfer-block__label">
+                    Metered TURN relay
+                  </span>
+                  <p className="transfer-block__desc">
+                    A TURN relay is required for P2P to work across different
+                    networks.{" "}
+                    <a
+                      href="https://www.metered.ca/signup"
+                      target="_blank"
+                      rel="noopener noreferrer">
+                      Create a free Metered.ca account
+                    </a>{" "}
+                    (500 MB / month free, no card required)/ (20 GB / month
+                    free, card required), then paste your domain and API key
+                    below.
+                  </p>
+                  <div className="p2p-settings__row">
+                    <input
+                      type="text"
+                      value={p2pMeteredDomain}
+                      onChange={(e) => setP2pMeteredDomain(e.target.value)}
+                      placeholder="yourapp.metered.live"
+                      disabled={p2pBusy}
+                    />
+                  </div>
+                  <div className="p2p-settings__row">
+                    <input
+                      type="password"
+                      value={p2pMeteredApiKey}
+                      onChange={(e) => setP2pMeteredApiKey(e.target.value)}
+                      placeholder="Metered API Key"
+                      disabled={p2pBusy}
+                    />
+                    {p2pMeteredApiKey.trim() && (
+                      <button
+                        className="btn-ghost btn-sm"
+                        title="Copy API Key"
+                        onClick={() => {
+                          navigator.clipboard
+                            .writeText(p2pMeteredApiKey.trim())
+                            .then(() => pushToast("API Key copied!", "success"))
+                            .catch(() => pushToast("Failed to copy.", "error"));
+                        }}>
+                        <IconCopy size={12} />
+                      </button>
+                    )}
+                  </div>
+                  <div className="btn-row">
+                    <button
+                      className="btn-secondary btn-sm"
+                      onClick={handleSaveP2PSettings}
+                      disabled={p2pBusy}>
+                      Save
+                    </button>
+                    <button
+                      className="btn-ghost btn-sm"
+                      onClick={handleClearP2PSettings}
+                      disabled={p2pBusy || !p2pHasMeteredFields}>
+                      Clear
+                    </button>
+                    <button
+                      className="btn-ghost btn-sm"
+                      onClick={handleTestP2P}
+                      disabled={
+                        p2pBusy || p2pTestStatus === "testing" || !p2pConfigured
+                      }>
+                      {p2pTestStatus === "testing" ? "Testing…" : "Test TURN"}
+                    </button>
+                  </div>
+                  {p2pTestStatus !== "idle" && (
+                    <div
+                      className={`p2p-status ${
+                        p2pTestStatus === "ok"
+                          ? "p2p-status--done"
+                          : p2pTestStatus === "warn"
+                            ? "p2p-status--active"
+                            : p2pTestStatus === "error"
+                              ? "p2p-status--error"
+                              : "p2p-status--active"
+                      }`}>
+                      {p2pTestMessage}
+                    </div>
+                  )}
+                </div>
+
+                {!p2pConfigured && (
+                  <div className="p2p-status p2p-status--error">
+                    P2P is disabled — configure your Metered.ca credentials
+                    above to enable sharing.
+                  </div>
+                )}
+
                 {p2pStatus === "idle" ||
                 p2pStatus === "done" ||
                 p2pStatus === "error" ? (
@@ -1712,7 +1894,13 @@ function App() {
                     <button
                       className="btn-secondary btn-full btn-sm"
                       onClick={handleP2PSend}
-                      disabled={!accountId || !worldId || loading || p2pBusy}>
+                      disabled={
+                        !accountId ||
+                        !worldId ||
+                        loading ||
+                        p2pBusy ||
+                        !p2pConfigured
+                      }>
                       Share Current World
                     </button>
 
@@ -1742,7 +1930,8 @@ function App() {
                         disabled={
                           !accountId ||
                           p2pReceiveCode.trim().length < 4 ||
-                          p2pBusy
+                          p2pBusy ||
+                          !p2pConfigured
                         }>
                         Connect
                       </button>
