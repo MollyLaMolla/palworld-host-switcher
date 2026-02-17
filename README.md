@@ -127,7 +127,17 @@ Stored **inside the world folder**, so it travels with the world when exported/s
 
 ---
 
-## 🚀 Getting Started
+## � Download
+
+Pre-built Windows installer (no build tools required):
+
+**[⬇️ Download Palworld Host Switcher](https://drive.google.com/drive/u/0/folders/1iUfwsw6elrihbwZLED2J0P3P0r_QxtYa)**
+
+Download the `.msi` or `_setup.exe` file, run the installer, and launch from the Start Menu.
+
+---
+
+## 🚀 Getting Started (Development)
 
 ### Prerequisites
 
