@@ -1104,6 +1104,187 @@ button:hover:not(:disabled) {
 
 /* ── Confirm Modal ─────────────────────────────────────── */
 
+/* ── Game-running overlay ──────────────────────────────── */
+
+.game-running-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.75);
+  backdrop-filter: blur(8px);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 9999;
+  animation: modal-fade-in 300ms ease-out;
+}
+
+.game-running-overlay__card {
+  text-align: center;
+  background: var(--bg-raised);
+  border: 2px solid #ef4444;
+  border-radius: 16px;
+  padding: 40px 48px;
+  max-width: 460px;
+  box-shadow:
+    0 0 60px rgba(239, 68, 68, 0.25),
+    0 20px 60px rgba(0, 0, 0, 0.6);
+  animation: modal-scale-in 300ms ease-out;
+}
+
+.game-running-overlay__icon {
+  color: #ef4444;
+  margin-bottom: 16px;
+  animation: pulse-alert 2s ease-in-out infinite;
+}
+
+.game-running-overlay__title {
+  margin: 0 0 12px;
+  font-size: 1.4rem;
+  font-weight: 700;
+  color: #ef4444;
+}
+
+.game-running-overlay__text {
+  font-size: 0.92rem;
+  color: var(--text);
+  line-height: 1.6;
+  margin: 0 0 16px;
+}
+
+.game-running-overlay__hint {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  margin: 0;
+  opacity: 0.7;
+}
+
+@keyframes pulse-alert {
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.6;
+    transform: scale(1.05);
+  }
+}
+
+/* ── P2P Transfer ──────────────────────────────────────── */
+
+.p2p-receive-row {
+  display: flex;
+  gap: 6px;
+  align-items: center;
+}
+
+.p2p-code-input {
+  flex: 1;
+  padding: 6px 10px;
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text);
+  font-size: 0.82rem;
+  font-family: "Consolas", "Fira Code", monospace;
+  letter-spacing: 2px;
+  text-align: center;
+  text-transform: uppercase;
+}
+
+.p2p-code-input:focus {
+  outline: none;
+  border-color: var(--border-focus);
+}
+
+.p2p-code-input::placeholder {
+  letter-spacing: 0;
+  text-transform: none;
+}
+
+.p2p-status {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  font-size: 0.78rem;
+  margin-top: 8px;
+}
+
+.p2p-status--done {
+  background: rgba(87, 171, 90, 0.12);
+  color: var(--success);
+}
+
+.p2p-status--error {
+  background: rgba(229, 83, 75, 0.12);
+  color: var(--danger);
+}
+
+.p2p-status--active {
+  background: var(--accent-muted);
+  color: var(--text);
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.p2p-active {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.p2p-code-display {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+}
+
+.p2p-code-label {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+
+.p2p-code-value {
+  font-family: "Consolas", "Fira Code", monospace;
+  font-size: 1.3rem;
+  font-weight: 700;
+  letter-spacing: 4px;
+  color: var(--accent);
+  user-select: all;
+}
+
+.p2p-status-text {
+  font-size: 0.78rem;
+  color: var(--text-secondary);
+}
+
+.progress-bar__fill--indeterminate {
+  width: 40% !important;
+  animation: indeterminate 1.4s ease-in-out infinite;
+}
+
+@keyframes indeterminate {
+  0% {
+    margin-left: 0;
+    width: 30%;
+  }
+  50% {
+    margin-left: 35%;
+    width: 40%;
+  }
+  100% {
+    margin-left: 70%;
+    width: 30%;
+  }
+}
+
+/* ── Confirm modal ─────────────────────────────────────── */
+
 .modal-overlay {
   position: fixed;
   inset: 0;

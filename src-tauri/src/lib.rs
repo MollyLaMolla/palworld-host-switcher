@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{Read, Seek, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command as StdCommand;
 use tauri::{AppHandle, Emitter, Manager};
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
@@ -668,8 +669,39 @@ fn export_world_sync(app: &AppHandle, account_id: &str, world_id: &str, dest_pat
     }
   }
 
-  // Count total files for progress
-  let entries: Vec<_> = WalkDir::new(&wdir).into_iter().filter_map(|e| e.ok()).collect();
+  // ── Build a set of old backup folders to SKIP ──────────────────────
+  // Palworld stores game backups in backup/world/<timestamp> and backup/local/<timestamp>.
+  // We keep only the most recent subfolder in each category to shrink the ZIP.
+  let mut skip_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+  for sub in &["world", "local"] {
+    let bdir = wdir.join("backup").join(sub);
+    if bdir.is_dir() {
+      if let Ok(rd) = fs::read_dir(&bdir) {
+        let mut folders: Vec<PathBuf> = rd
+          .filter_map(|e| e.ok())
+          .filter(|e| e.path().is_dir())
+          .map(|e| e.path())
+          .collect();
+        // Sort by folder name descending (timestamp format sorts lexicographically)
+        folders.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        // Skip everything except the first (most recent)
+        for old in folders.iter().skip(1) {
+          skip_dirs.insert(old.clone());
+        }
+      }
+    }
+  }
+
+  // Count total files for progress (excluding skipped backup dirs)
+  let entries: Vec<_> = WalkDir::new(&wdir)
+    .into_iter()
+    .filter_map(|e| e.ok())
+    .filter(|e| {
+      let p = e.path();
+      !skip_dirs.iter().any(|sk| p.starts_with(sk))
+    })
+    .collect();
   let total = entries.iter().filter(|e| e.path().is_file()).count().max(1);
   let mut done = 0usize;
   let mut last_pct = 0u32;
@@ -867,17 +899,45 @@ fn import_world_sync(
   }
 
   if mode == "replace" {
-    // Remove existing world folder before copying
     if target.exists() {
-      fs::remove_dir_all(&target)
-        .map_err(|e| format!("Cannot remove existing world: {e}"))?;
+      // Remove everything EXCEPT backup/world and backup/local
+      remove_dir_except_backups(&target)
+        .map_err(|e| format!("Cannot clean existing world: {e}"))?;
     }
   }
 
-  // Count total files for progress
+  // ── Build skip-set for old backups in the SOURCE ──────────────────
+  // Keep only the most recent backup subfolder in each category
+  // so we don't bloat the destination with tons of old backup folders.
+  let mut skip_src_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+
+  for sub in &["world", "local"] {
+    let bdir = src.join("backup").join(sub);
+    if bdir.is_dir() {
+      if let Ok(rd) = fs::read_dir(&bdir) {
+        let mut folders: Vec<PathBuf> = rd
+          .filter_map(|e| e.ok())
+          .filter(|e| e.path().is_dir())
+          .map(|e| e.path())
+          .collect();
+        // Sort descending by name (timestamp format sorts lexicographically)
+        folders.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+        // Skip everything except the most recent
+        for old in folders.iter().skip(1) {
+          skip_src_dirs.insert(old.clone());
+        }
+      }
+    }
+  }
+
+  // Count total files for progress (excluding skipped backup dirs)
   let total_files = WalkDir::new(&src)
     .into_iter()
     .filter_map(|e| e.ok())
+    .filter(|e| {
+      let p = e.path();
+      !skip_src_dirs.iter().any(|sk| p.starts_with(sk))
+    })
     .filter(|e| e.path().is_file())
     .count()
     .max(1);
@@ -886,8 +946,8 @@ fn import_world_sync(
 
   let _ = app.emit("import-progress", ProgressPayload { percent: 0.0, message: "Starting import…".to_string() });
 
-  // Recursively copy src into target
-  copy_dir_recursive(&src, &target, app, &counter, total_files, &mut last_pct)?;
+  // Recursively copy src into target, merging backups and skipping old ones
+  copy_dir_recursive_merge(&src, &target, app, &counter, total_files, &mut last_pct, &skip_src_dirs)?;
 
   let _ = app.emit("import-progress", ProgressPayload { percent: 100.0, message: "Import complete.".to_string() });
 
@@ -895,14 +955,45 @@ fn import_world_sync(
   get_worlds_with_counts(account_id.to_string())
 }
 
-/// Recursively copy a directory from src to dest with progress tracking.
-fn copy_dir_recursive(
+/// Remove all contents of a world directory EXCEPT backup/world and backup/local.
+/// This preserves existing game backups while replacing everything else.
+fn remove_dir_except_backups(dir: &Path) -> std::io::Result<()> {
+  for entry in fs::read_dir(dir)? {
+    let entry = entry?;
+    let path = entry.path();
+    let name = entry.file_name();
+
+    if name == "backup" && path.is_dir() {
+      // Inside the backup folder, remove everything except "world" and "local"
+      for bentry in fs::read_dir(&path)? {
+        let bentry = bentry?;
+        let bname = bentry.file_name();
+        if bname != "world" && bname != "local" {
+          if bentry.path().is_dir() {
+            fs::remove_dir_all(bentry.path())?;
+          } else {
+            fs::remove_file(bentry.path())?;
+          }
+        }
+      }
+    } else if path.is_dir() {
+      fs::remove_dir_all(&path)?;
+    } else {
+      fs::remove_file(&path)?;
+    }
+  }
+  Ok(())
+}
+
+/// Recursively copy src to dest, merging backup directories and skipping old backup folders.
+fn copy_dir_recursive_merge(
   src: &Path,
   dest: &Path,
   app: &AppHandle,
   counter: &std::sync::atomic::AtomicUsize,
   total: usize,
   last_pct: &mut u32,
+  skip_dirs: &std::collections::HashSet<PathBuf>,
 ) -> Result<(), String> {
   if !dest.exists() {
     fs::create_dir_all(dest).map_err(|e| format!("Cannot create {}: {e}", dest.display()))?;
@@ -910,15 +1001,21 @@ fn copy_dir_recursive(
   for entry in fs::read_dir(src).map_err(|e| format!("Cannot read {}: {e}", src.display()))? {
     let entry = entry.map_err(|e| e.to_string())?;
     let path = entry.path();
+
+    // Skip old backup folders from the source
+    if skip_dirs.iter().any(|sk| path == *sk || path.starts_with(sk)) {
+      continue;
+    }
+
     let dest_path = dest.join(entry.file_name());
     if path.is_dir() {
-      copy_dir_recursive(&path, &dest_path, app, counter, total, last_pct)?;
+      // For backup subdirs that already exist at destination, don't clear them — just merge
+      copy_dir_recursive_merge(&path, &dest_path, app, counter, total, last_pct, skip_dirs)?;
     } else {
       fs::copy(&path, &dest_path)
         .map_err(|e| format!("Cannot copy {}: {e}", path.display()))?;
       let done = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
       let pct = (done as f64 / total as f64 * 100.0).min(100.0) as u32;
-      // Throttle: emit only when percentage changes by at least 2%
       if pct >= *last_pct + 2 || done == total {
         *last_pct = pct;
         let _ = app.emit("import-progress", ProgressPayload { percent: pct as f64, message: format!("Copying… {done}/{total}") });
@@ -929,8 +1026,177 @@ fn copy_dir_recursive(
 }
 
 #[tauri::command]
+fn is_palworld_running() -> bool {
+  use std::os::windows::process::CommandExt;
+  const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+  if let Ok(output) = StdCommand::new("tasklist")
+    .args(["/FI", "IMAGENAME eq Palworld-Win64-Shipping.exe", "/NH", "/FO", "CSV"])
+    .creation_flags(CREATE_NO_WINDOW)
+    .output()
+  {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout.contains("Palworld-Win64-Shipping.exe")
+  } else {
+    false
+  }
+}
+
+#[tauri::command]
 fn rescan_storage() -> Result<(), String> {
   Ok(())
+}
+
+// ── P2P Transfer helper commands ──────────────────────────
+
+/// Export a world to a temporary ZIP file for P2P sharing.
+/// Returns the full path to the temp ZIP.
+#[tauri::command]
+async fn export_world_to_temp(app: AppHandle, account_id: String, world_id: String) -> Result<String, String> {
+  let temp_path = std::env::temp_dir()
+    .join(format!("palhost_share_{}.zip", &world_id))
+    .to_string_lossy()
+    .to_string();
+  let tp = temp_path.clone();
+  let app2 = app.clone();
+  tauri::async_runtime::spawn_blocking(move || {
+    export_world_sync(&app2, &account_id, &world_id, &tp)
+  })
+  .await
+  .map_err(|e| format!("Task error: {e}"))?
+}
+
+/// Get the file size in bytes.
+#[tauri::command]
+fn get_file_size(path: String) -> Result<u64, String> {
+  let meta = fs::metadata(&path).map_err(|e| format!("Cannot read: {e}"))?;
+  Ok(meta.len())
+}
+
+/// Read a binary chunk from a file. Returns Vec<u8> → ArrayBuffer on JS side.
+#[tauri::command]
+fn read_file_chunk(path: String, offset: u64, length: u64) -> Result<Vec<u8>, String> {
+  let mut f = fs::File::open(&path).map_err(|e| format!("Cannot open: {e}"))?;
+  f.seek(std::io::SeekFrom::Start(offset)).map_err(|e| format!("Seek error: {e}"))?;
+  let mut buf = vec![0u8; length as usize];
+  let n = f.read(&mut buf).map_err(|e| format!("Read error: {e}"))?;
+  buf.truncate(n);
+  Ok(buf)
+}
+
+/// Decode a base64 string and append it to a file (creates if needed).
+#[tauri::command]
+fn append_file_chunk_b64(path: String, data_b64: String) -> Result<(), String> {
+  let data = base64_decode(&data_b64)
+    .map_err(|_| "Invalid base64 data".to_string())?;
+  let mut f = fs::OpenOptions::new()
+    .create(true)
+    .append(true)
+    .open(&path)
+    .map_err(|e| format!("Cannot open: {e}"))?;
+  f.write_all(&data).map_err(|e| format!("Write error: {e}"))?;
+  Ok(())
+}
+
+/// Get a path in the system temp directory for receiving P2P files.
+#[tauri::command]
+fn get_temp_path(filename: String) -> String {
+  std::env::temp_dir()
+    .join(&filename)
+    .to_string_lossy()
+    .to_string()
+}
+
+/// Delete a temporary file.
+#[tauri::command]
+fn delete_temp_file(path: String) -> Result<(), String> {
+  let p = Path::new(&path);
+  if p.exists() {
+    if p.is_dir() {
+      fs::remove_dir_all(p).map_err(|e| format!("Cannot delete: {e}"))?;
+    } else {
+      fs::remove_file(p).map_err(|e| format!("Cannot delete: {e}"))?;
+    }
+  }
+  Ok(())
+}
+
+/// Extract a ZIP file to a temp directory and return the extracted folder path.
+#[tauri::command]
+fn extract_zip_to_temp(zip_path: String) -> Result<String, String> {
+  let zip_file = fs::File::open(&zip_path)
+    .map_err(|e| format!("Cannot open ZIP: {e}"))?;
+  let mut archive = zip::ZipArchive::new(zip_file)
+    .map_err(|e| format!("Invalid ZIP: {e}"))?;
+
+  let extract_dir = std::env::temp_dir().join("palhost_p2p_extract");
+  // Clean previous extraction
+  if extract_dir.exists() {
+    let _ = fs::remove_dir_all(&extract_dir);
+  }
+  fs::create_dir_all(&extract_dir)
+    .map_err(|e| format!("Cannot create temp dir: {e}"))?;
+
+  for i in 0..archive.len() {
+    let mut file = archive.by_index(i)
+      .map_err(|e| format!("ZIP read error: {e}"))?;
+    let out_path = extract_dir.join(file.mangled_name());
+
+    if file.is_dir() {
+      fs::create_dir_all(&out_path)
+        .map_err(|e| format!("Cannot create dir: {e}"))?;
+    } else {
+      if let Some(parent) = out_path.parent() {
+        fs::create_dir_all(parent)
+          .map_err(|e| format!("Cannot create parent: {e}"))?;
+      }
+      let mut out_file = fs::File::create(&out_path)
+        .map_err(|e| format!("Cannot create file: {e}"))?;
+      std::io::copy(&mut file, &mut out_file)
+        .map_err(|e| format!("Extract error: {e}"))?;
+    }
+  }
+
+  // Find the world folder inside (should be the first directory)
+  let mut world_folder = extract_dir.clone();
+  if let Ok(entries) = fs::read_dir(&extract_dir) {
+    for entry in entries.flatten() {
+      if entry.path().is_dir() {
+        world_folder = entry.path();
+        break;
+      }
+    }
+  }
+
+  Ok(world_folder.to_string_lossy().to_string())
+}
+
+/// Simple base64 decoder (no extra crate needed).
+fn base64_decode(input: &str) -> Result<Vec<u8>, ()> {
+  let table: [u8; 128] = {
+    let mut t = [255u8; 128];
+    for (i, &c) in b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/".iter().enumerate() {
+      t[c as usize] = i as u8;
+    }
+    t
+  };
+  let input = input.as_bytes();
+  let mut out = Vec::with_capacity(input.len() * 3 / 4);
+  let mut buf = 0u32;
+  let mut bits = 0u32;
+  for &b in input {
+    if b == b'=' || b == b'\n' || b == b'\r' || b == b' ' { continue; }
+    let val = if (b as usize) < 128 { table[b as usize] } else { 255 };
+    if val == 255 { return Err(()); }
+    buf = (buf << 6) | val as u32;
+    bits += 6;
+    if bits >= 8 {
+      bits -= 8;
+      out.push((buf >> bits) as u8);
+      buf &= (1 << bits) - 1;
+    }
+  }
+  Ok(out)
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -970,7 +1236,15 @@ pub fn run() {
       import_world,
       set_world_name,
       reset_world_name,
-      rescan_storage
+      is_palworld_running,
+      rescan_storage,
+      export_world_to_temp,
+      get_file_size,
+      read_file_chunk,
+      append_file_chunk_b64,
+      get_temp_path,
+      delete_temp_file,
+      extract_zip_to_temp
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

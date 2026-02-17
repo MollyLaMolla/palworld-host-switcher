@@ -1,7 +1,7 @@
 # 🎮 Palworld Host Switcher
 
 A lightweight desktop application for managing **Palworld** dedicated/co-op save files.
-Swap host ownership, rename players, transfer worlds between machines, and create backups — all from a clean, modern UI without touching raw game files.
+Swap host ownership, rename players, transfer worlds between machines, share worlds peer-to-peer, and create backups — all from a clean, modern UI without touching raw game files.
 
 ![Tauri](https://img.shields.io/badge/Tauri-v2-blue?logo=tauri)
 ![React](https://img.shields.io/badge/React-19-61dafb?logo=react)
@@ -25,9 +25,18 @@ Swap host ownership, rename players, transfer worlds between machines, and creat
 ### World Management
 
 - **World display names** — give each world a custom name shown in the UI (folder name stays unchanged)
-- **World transfer (Export)** — export an entire world as a `.zip` archive to share with others
+- **World transfer (Export)** — export an entire world as a `.zip` archive to share with others; only the most recent backup is included to keep file size small
 - **World transfer (Import)** — import a world from a folder or ZIP via file browser or drag & drop from the OS
 - **Conflict detection** — importing a world that already exists lets you choose to replace or create a copy with a new name
+- **Smart import merge** — when replacing an existing world, backups from both the existing and imported world are preserved and merged together
+
+### P2P World Transfer
+
+- **Peer-to-peer sharing** — share worlds directly between two PCs over the internet using WebRTC (no server upload needed)
+- **Sender flow** — click **Share**, get a 6-character code, and share it with the receiver
+- **Receiver flow** — enter the code, choose where to save the ZIP, and the world transfers directly from the sender's PC
+- **Progress tracking** — real-time progress bar and status messages for both sender and receiver
+- **Auto-import** — received worlds are automatically extracted and presented for import into your game
 
 ### Backup System
 
@@ -39,11 +48,14 @@ Swap host ownership, rename players, transfer worlds between machines, and creat
 ### UI / UX
 
 - **Dark theme** — modern dark interface with accent colors
+- **Splash screen** — instant dark splash loader prevents white flash on startup
+- **Game-running safety lock** — detects if Palworld is running and blocks all operations with a full-screen overlay to prevent save corruption
 - **Resizable sidebar** — drag the divider to resize the sidebar
 - **Activity log** — collapsible console showing timestamped operation history
 - **Toast notifications** — non-blocking success/error/info popups
-- **Progress bars** — real-time progress for export and import operations (non-blocking, runs on background thread)
+- **Progress bars** — real-time progress for export, import, and P2P transfer operations (non-blocking, runs on background thread)
 - **Search** — filter players by name or ID
+- **Rescan** — manually re-scan the save folder to pick up external changes (added/deleted worlds)
 
 ---
 
@@ -58,6 +70,7 @@ Swap host ownership, rename players, transfer worlds between machines, and creat
 | **Dialogs**     | `tauri-plugin-dialog`     | Native file/folder pickers, confirm dialogs           |
 | **Compression** | `zip` crate (Rust)        | World export/import as `.zip`                         |
 | **File walk**   | `walkdir` crate           | Recursive directory traversal for export              |
+| **P2P**         | PeerJS (WebRTC)           | Direct peer-to-peer world transfer between PCs        |
 
 ---
 
@@ -69,7 +82,8 @@ palworld-host-switcher/
 │   ├── App.tsx                   # Main component — all UI logic
 │   ├── App.css                   # Complete stylesheet (dark theme)
 │   └── services/
-│       └── palworldService.ts    # Tauri IPC invoke wrappers
+│       ├── palworldService.ts    # Tauri IPC invoke wrappers
+│       └── p2pService.ts         # WebRTC P2P file transfer (PeerJS)
 ├── src-tauri/                    # Rust backend
 │   ├── src/lib.rs                # All Tauri commands & file logic
 │   ├── tauri.conf.json           # App config (window, bundle, etc.)
@@ -77,7 +91,7 @@ palworld-host-switcher/
 │   ├── icons/                    # Generated app icons (all sizes)
 │   └── capabilities/             # Tauri v2 permission capabilities
 ├── public/                       # Static assets
-├── index.html                    # Entry point
+├── index.html                    # Entry point (includes splash loader)
 ├── package.json                  # Node dependencies & scripts
 ├── vite.config.ts                # Vite configuration
 └── .github/
@@ -187,15 +201,18 @@ Double-click either installer to install the app. It will appear in your Start M
 ## 🖥️ Usage
 
 1. **Launch the app** — double-click the installed app or run `npx tauri dev`
-2. **Select Account** — your Steam account ID is auto-detected from the sidebar dropdown
-3. **Select World** — pick the world you want to manage
-4. **Rename the world** _(optional)_ — click the ✏️ pencil icon above the player list to set a friendly name
-5. **View players** — all players with `.sav` files appear as cards
-6. **Swap players** — click **Edit**, then drag one player card onto another to swap their slot data
-7. **Rename players** — click the pencil icon on a player card to set a display name
-8. **Change host slot** — use the **Host slot** section in the sidebar to reassign host ownership
-9. **Backup / Restore** — use the sidebar Backup section before making changes
-10. **Export / Import world** — use the sidebar World Transfer section to share worlds as ZIP files
+2. **Close Palworld first** — if the game is running, a safety overlay blocks all operations to prevent save corruption
+3. **Select Account** — your Steam account ID is auto-detected from the sidebar dropdown
+4. **Select World** — pick the world you want to manage
+5. **Rename the world** _(optional)_ — click the ✏️ pencil icon above the player list to set a friendly name
+6. **View players** — all players with `.sav` files appear as cards
+7. **Swap players** — click **Edit**, then drag one player card onto another to swap their slot data
+8. **Rename players** — click the pencil icon on a player card to set a display name
+9. **Change host slot** — use the **Host slot** section in the sidebar to reassign host ownership
+10. **Backup / Restore** — use the sidebar Backup section before making changes
+11. **Export / Import world** — use the sidebar World Transfer section to share worlds as ZIP files
+12. **P2P Transfer** — share a world directly with another PC: click **Share** to get a code, or enter a code to **Receive**
+13. **Rescan** — click the Rescan button to refresh if you've made changes outside the app
 
 ---
 
@@ -209,6 +226,11 @@ Double-click either installer to install the app. It will appear in your Start M
 | Player names lost after world import                        | UI didn't refresh players/backups after import when `worldId` stayed the same                  | Explicitly re-fetch players, host slot, and backups after successful import                       |
 | Nested folder detection for imports                         | Users often zip the world inside an extra parent folder                                        | `validate_world_folder` auto-detects and resolves same-name subfolder or single-subfolder nesting |
 | Backup didn't preserve world display name                   | `BackupSnapshot` didn't include `display_name`                                                 | Added `display_name` to snapshot with `#[serde(default)]` for backward compatibility              |
+| Console window flash every 3 seconds                        | `tasklist` process detection opened visible CMD windows in production                          | Added `CREATE_NO_WINDOW` flag (0x08000000) via `.creation_flags()` on Windows                     |
+| White flash on app startup                                  | React takes a moment to mount, showing a blank white page                                      | Inline dark splash loader in `index.html` with spinner, fades out once React mounts               |
+| Missing permissions in production build                     | Tauri v2 capabilities not configured for events, webview, and dialog in production             | Added `core:event`, `core:webview`, and `dialog` permissions to `capabilities/default.json`       |
+| Exported ZIP too large                                      | All backup history included in export                                                          | Only the most recent backup subfolder is included; older ones are skipped                         |
+| Rescan doesn't detect deleted worlds                        | Rescan only refreshed accounts, didn't cascade re-fetch worlds/players/backups                 | Rescan now fully re-loads accounts → worlds → players → backups from disk                         |
 
 ---
 
@@ -216,23 +238,29 @@ Double-click either installer to install the app. It will appear in your Start M
 
 All commands exposed via `tauri::generate_handler!`:
 
-| Command                                                 | Description                                                  |
-| ------------------------------------------------------- | ------------------------------------------------------------ |
-| `get_accounts`                                          | List Steam account IDs from SaveGames folder                 |
-| `get_worlds` / `get_worlds_with_counts`                 | List worlds with player counts and display names             |
-| `get_players`                                           | List players with names, host status, original IDs           |
-| `set_host_player`                                       | Swap a player into the host slot (swaps `.sav` files)        |
-| `swap_players`                                          | Swap two players' slot data and files                        |
-| `set_host_slot`                                         | Set which slot ID is considered host (config only)           |
-| `set_player_name` / `reset_player_names`                | Rename a player / reset all names to slot IDs                |
-| `set_world_name` / `reset_world_name`                   | Set or clear a world's display name                          |
-| `create_backup` / `restore_backup`                      | Create or restore a full snapshot                            |
-| `list_backups` / `delete_backup` / `delete_all_backups` | Manage backup history                                        |
-| `export_world`                                          | Export world as `.zip` (async, with progress events)         |
-| `validate_world_folder`                                 | Validate a folder structure as a valid Palworld world        |
-| `check_world_exists`                                    | Check if a world name already exists under an account        |
-| `import_world`                                          | Import a world folder (replace or copy, async with progress) |
-| `rescan_storage`                                        | Force re-scan of the SaveGames directory                     |
+| Command                                                 | Description                                                |
+| ------------------------------------------------------- | ---------------------------------------------------------- |
+| `get_accounts`                                          | List Steam account IDs from SaveGames folder               |
+| `get_worlds` / `get_worlds_with_counts`                 | List worlds with player counts and display names           |
+| `get_players`                                           | List players with names, host status, original IDs         |
+| `set_host_player`                                       | Swap a player into the host slot (swaps `.sav` files)      |
+| `swap_players`                                          | Swap two players' slot data and files                      |
+| `set_host_slot`                                         | Set which slot ID is considered host (config only)         |
+| `set_player_name` / `reset_player_names`                | Rename a player / reset all names to slot IDs              |
+| `set_world_name` / `reset_world_name`                   | Set or clear a world's display name                        |
+| `create_backup` / `restore_backup`                      | Create or restore a full snapshot                          |
+| `list_backups` / `delete_backup` / `delete_all_backups` | Manage backup history                                      |
+| `export_world`                                          | Export world as `.zip` (async, with progress events)       |
+| `validate_world_folder`                                 | Validate a folder structure as a valid Palworld world      |
+| `check_world_exists`                                    | Check if a world name already exists under an account      |
+| `import_world`                                          | Import a world folder (replace or copy, with backup merge) |
+| `rescan_storage`                                        | Force re-scan of the SaveGames directory                   |
+| `is_palworld_running`                                   | Detect if Palworld is running (silent, no console window)  |
+| `export_world_to_temp`                                  | Export world to a temp ZIP for P2P sharing                 |
+| `get_file_size` / `read_file_chunk`                     | Read binary file data in chunks (for P2P transfer)         |
+| `append_file_chunk_b64`                                 | Append base64-encoded chunk to a file (P2P receiver)       |
+| `get_temp_path` / `delete_temp_file`                    | Manage temporary files                                     |
+| `extract_zip_to_temp`                                   | Extract a received ZIP to a temp folder for validation     |
 
 ---
 

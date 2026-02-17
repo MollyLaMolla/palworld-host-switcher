@@ -24,9 +24,18 @@ import {
   setWorldName,
   swapPlayers,
   validateWorldFolder,
+  isPalworldRunning,
+  exportWorldToTemp,
+  deleteTempFile,
   type Player,
   type WorldInfo,
 } from "./services/palworldService";
+import {
+  startSending,
+  startReceiving,
+  cancelP2P,
+  type P2PStatus,
+} from "./services/p2pService";
 
 /* ── SVG Icons ─────────────────────────────────────────── */
 const s = {
@@ -333,6 +342,41 @@ const IconFolder = ({ size = 14 }: { size?: number }) => (
   </svg>
 );
 
+const IconShare = ({ size = 14 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    style={s}>
+    <circle cx="18" cy="5" r="3" />
+    <circle cx="6" cy="12" r="3" />
+    <circle cx="18" cy="19" r="3" />
+    <line x1="8.59" y1="13.51" x2="15.42" y2="17.49" />
+    <line x1="15.41" y1="6.51" x2="8.59" y2="10.49" />
+  </svg>
+);
+
+const IconCopy = ({ size = 14 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    style={s}>
+    <rect x="9" y="9" width="13" height="13" rx="2" ry="2" />
+    <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1" />
+  </svg>
+);
+
 /* ── Collapsible section ───────────────────────────────── */
 function Section({
   title,
@@ -377,6 +421,15 @@ function App() {
   const [loading, setLoading] = useState(false);
   const [editingPlayerId, setEditingPlayerId] = useState<string | null>(null);
 
+  /* ── P2P Transfer state ──────────────────────────────── */
+  const [p2pStatus, setP2pStatus] = useState<P2PStatus>("idle");
+  const [p2pMessage, setP2pMessage] = useState("");
+  const [p2pProgress, setP2pProgress] = useState(0);
+  const [p2pCode, setP2pCode] = useState("");
+  const [p2pReceiveCode, setP2pReceiveCode] = useState("");
+  const [p2pCopied, setP2pCopied] = useState(false);
+  const [p2pTempZip, setP2pTempZip] = useState<string | null>(null);
+
   /* ── World name editing ────────────────────────────── */
   const [editingWorldName, setEditingWorldName] = useState(false);
   const [worldNameDraft, setWorldNameDraft] = useState("");
@@ -396,6 +449,37 @@ function App() {
   useEffect(() => {
     accountIdRef.current = accountId;
   }, [accountId]);
+
+  /* ── Dismiss splash loader once React has mounted ──── */
+  useEffect(() => {
+    const splash = document.getElementById("splash-loader");
+    if (splash) {
+      splash.classList.add("fade-out");
+      const timer = setTimeout(() => splash.remove(), 200);
+      return () => clearTimeout(timer);
+    }
+  }, []);
+
+  /* ── Palworld process detection ────────────────────── */
+  const [gameRunning, setGameRunning] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    const check = async () => {
+      try {
+        const running = await isPalworldRunning();
+        if (active) setGameRunning(running);
+      } catch {
+        // ignore
+      }
+    };
+    check();
+    const id = window.setInterval(check, 3000);
+    return () => {
+      active = false;
+      window.clearInterval(id);
+    };
+  }, []);
 
   /* ── Custom confirm modal ──────────────────────────── */
   const [confirmModal, setConfirmModal] = useState<{
@@ -594,9 +678,45 @@ function App() {
     setLoading(true);
     try {
       await rescanStorage();
-      const items = await getAccounts();
-      setAccounts(items);
-      setAccountId(items[0] ?? "");
+
+      // Re-fetch everything from disk, exactly like app startup
+      const accs = await getAccounts();
+      setAccounts(accs);
+      const selAccount = accs[0] ?? "";
+      setAccountId(selAccount);
+
+      if (selAccount) {
+        const ws = await getWorldsWithCounts(selAccount);
+        setWorlds(ws);
+        const selWorld = ws[0]?.id ?? "";
+        setWorldId(selWorld);
+
+        if (selWorld) {
+          const ps = await getPlayers(selAccount, selWorld);
+          setPlayers(ps);
+          setHostSlotState(ps.find((p) => p.isHost)?.id ?? "");
+          const nextEdits: Record<string, string> = {};
+          ps.forEach((p) => {
+            nextEdits[p.id] = p.name;
+          });
+          setNameEdits(nextEdits);
+
+          const bk = await listBackups(selAccount, selWorld);
+          setBackups(bk);
+          setBackupTarget(bk[0] ?? "");
+        } else {
+          setPlayers([]);
+          setBackups([]);
+          setBackupTarget("");
+        }
+      } else {
+        setWorlds([]);
+        setWorldId("");
+        setPlayers([]);
+        setBackups([]);
+        setBackupTarget("");
+      }
+
       pushLog("Storage rescan complete.");
       pushToast("Storage rescan complete.");
     } catch (err) {
@@ -1135,6 +1255,128 @@ function App() {
     setImportNewName("");
   };
 
+  /* ── P2P Share handlers ────────────────────────────── */
+
+  const handleP2PSend = async () => {
+    if (!accountId || !worldId) return;
+    setP2pStatus("preparing");
+    setP2pMessage("Preparing ZIP…");
+    setP2pProgress(0);
+    setP2pCode("");
+    setP2pCopied(false);
+    try {
+      pushLog("P2P: Creating temp ZIP for sharing…");
+      const zipPath = await exportWorldToTemp(accountId, worldId);
+      setP2pTempZip(zipPath);
+      pushLog("P2P: ZIP ready, waiting for peer…");
+
+      await startSending(zipPath, {
+        onStatus: (status, message) => {
+          setP2pStatus(status);
+          setP2pMessage(message ?? "");
+          if (status === "waiting")
+            pushLog("P2P: Waiting for peer to connect…");
+          if (status === "transferring")
+            pushLog("P2P: Peer connected, sending file…");
+          if (status === "error") pushLog(`P2P: Error — ${message}`);
+        },
+        onProgress: (pct) => setP2pProgress(pct),
+        onCode: (code) => {
+          setP2pCode(code);
+          pushLog(`P2P: Code generated: ${code}`);
+        },
+      });
+
+      pushLog("P2P: World sent successfully!");
+      pushToast("World shared via P2P!", "success");
+    } catch (err) {
+      pushLog(`P2P send error: ${err}`);
+      if (p2pStatus !== "error") {
+        pushToast(`P2P failed: ${err}`, "error");
+      }
+    } finally {
+      // Cleanup temp ZIP
+      if (p2pTempZip) {
+        deleteTempFile(p2pTempZip).catch(() => {});
+        setP2pTempZip(null);
+      }
+    }
+  };
+
+  const handleP2PReceive = async () => {
+    const code = p2pReceiveCode.trim();
+    if (!code || code.length < 4) {
+      pushToast("Enter a valid code.", "error");
+      return;
+    }
+    if (!accountId) {
+      pushToast("Select an account first.", "error");
+      return;
+    }
+
+    // Let user choose where to save the received ZIP
+    const dest = await save({
+      defaultPath: "world.zip",
+      filters: [{ name: "ZIP Archive", extensions: ["zip"] }],
+    });
+    if (!dest) return; // user cancelled
+
+    setP2pStatus("connecting");
+    setP2pMessage("Connecting…");
+    setP2pProgress(0);
+    try {
+      pushLog(`P2P: Connecting to sender with code ${code}…`);
+      const folderPath = await startReceiving(code, dest, {
+        onStatus: (status, message) => {
+          setP2pStatus(status);
+          setP2pMessage(message ?? "");
+          if (status === "connecting") pushLog(`P2P: ${message}`);
+          if (status === "transferring") pushLog("P2P: Receiving file…");
+          if (status === "extracting")
+            pushLog("P2P: Download complete, extracting ZIP…");
+          if (status === "done") pushLog("P2P: Extraction complete!");
+          if (status === "error") pushLog(`P2P: Error — ${message}`);
+        },
+        onProgress: (pct) => setP2pProgress(pct),
+      });
+
+      pushLog(`P2P: World received and saved to ${dest}`);
+      // Use existing import flow
+      await processImportFolder(folderPath);
+      pushToast("World received! Review import options below.", "success");
+    } catch (err) {
+      pushLog(`P2P receive error: ${err}`);
+      if (p2pStatus !== "error") {
+        pushToast(`P2P receive failed: ${err}`, "error");
+      }
+    }
+  };
+
+  const handleP2PCancel = () => {
+    cancelP2P();
+    if (p2pTempZip) {
+      deleteTempFile(p2pTempZip).catch(() => {});
+      setP2pTempZip(null);
+    }
+    setP2pStatus("idle");
+    setP2pMessage("");
+    setP2pProgress(0);
+    setP2pCode("");
+    setP2pReceiveCode("");
+  };
+
+  const handleCopyCode = () => {
+    if (p2pCode) {
+      navigator.clipboard.writeText(p2pCode).then(() => {
+        setP2pCopied(true);
+        setTimeout(() => setP2pCopied(false), 2000);
+      });
+    }
+  };
+
+  const p2pBusy =
+    p2pStatus !== "idle" && p2pStatus !== "done" && p2pStatus !== "error";
+
   const playerOptions = players.map((player) => (
     <option key={player.id} value={player.id}>
       {player.name} ({player.id})
@@ -1154,6 +1396,27 @@ function App() {
 
   return (
     <div className="app">
+      {/* ── Game running overlay ─────────────────────────── */}
+      {gameRunning && (
+        <div className="game-running-overlay">
+          <div className="game-running-overlay__card">
+            <div className="game-running-overlay__icon">
+              <IconAlert size={48} />
+            </div>
+            <h2 className="game-running-overlay__title">Palworld is running</h2>
+            <p className="game-running-overlay__text">
+              Close the game before making any changes to save files.
+              <br />
+              Editing files while playing can cause{" "}
+              <strong>data corruption</strong>.
+            </p>
+            <p className="game-running-overlay__hint">
+              This overlay will disappear automatically when the game is closed.
+            </p>
+          </div>
+        </div>
+      )}
+
       {/* ── Header ──────────────────────────────────────── */}
       <header className="app__header">
         <div className="app__brand">
@@ -1426,6 +1689,134 @@ function App() {
                         </span>
                       </div>
                     )}
+                  </div>
+                )}
+              </div>
+            </Section>
+
+            <Section title="P2P Transfer" defaultOpen={false}>
+              <div className="transfer-block">
+                <p className="transfer-block__desc">
+                  Share worlds directly with another player via peer-to-peer. No
+                  server needed — data travels directly between PCs.
+                </p>
+
+                {p2pStatus === "idle" ||
+                p2pStatus === "done" ||
+                p2pStatus === "error" ? (
+                  <>
+                    {/* Send */}
+                    <span className="transfer-block__label">
+                      <IconShare size={12} /> Share World
+                    </span>
+                    <button
+                      className="btn-secondary btn-full btn-sm"
+                      onClick={handleP2PSend}
+                      disabled={!accountId || !worldId || loading || p2pBusy}>
+                      Share Current World
+                    </button>
+
+                    <div className="transfer-divider" />
+
+                    {/* Receive */}
+                    <span className="transfer-block__label">
+                      <IconDownload size={12} /> Receive World
+                    </span>
+                    <div className="p2p-receive-row">
+                      <input
+                        className="p2p-code-input"
+                        value={p2pReceiveCode}
+                        onChange={(e) =>
+                          setP2pReceiveCode(e.target.value.toUpperCase())
+                        }
+                        placeholder="Enter code…"
+                        maxLength={6}
+                        disabled={p2pBusy}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") handleP2PReceive();
+                        }}
+                      />
+                      <button
+                        className="btn-primary btn-sm"
+                        onClick={handleP2PReceive}
+                        disabled={
+                          !accountId ||
+                          p2pReceiveCode.trim().length < 4 ||
+                          p2pBusy
+                        }>
+                        Connect
+                      </button>
+                    </div>
+
+                    {/* Show last result */}
+                    {p2pStatus === "done" && (
+                      <div className="p2p-status p2p-status--done">
+                        <IconCheck size={12} /> {p2pMessage}
+                      </div>
+                    )}
+                    {p2pStatus === "error" && (
+                      <div className="p2p-status p2p-status--error">
+                        <IconAlert size={12} /> {p2pMessage}
+                      </div>
+                    )}
+                  </>
+                ) : (
+                  /* Active transfer */
+                  <div className="p2p-active">
+                    <div className="p2p-status p2p-status--active">
+                      {p2pStatus === "waiting" && p2pCode ? (
+                        <>
+                          <div className="p2p-code-display">
+                            <span className="p2p-code-label">
+                              Share this code:
+                            </span>
+                            <span className="p2p-code-value">{p2pCode}</span>
+                            <button
+                              className="btn-ghost btn-sm"
+                              onClick={handleCopyCode}
+                              title="Copy code">
+                              {p2pCopied ? (
+                                <IconCheck size={12} />
+                              ) : (
+                                <IconCopy size={12} />
+                              )}
+                            </button>
+                          </div>
+                          <span className="p2p-status-text">
+                            Waiting for peer to connect…
+                          </span>
+                        </>
+                      ) : (
+                        <span className="p2p-status-text">{p2pMessage}</span>
+                      )}
+                    </div>
+
+                    {(p2pStatus === "transferring" ||
+                      p2pStatus === "extracting") && (
+                      <div className="progress-bar">
+                        <div
+                          className="progress-bar__fill"
+                          style={{
+                            width: `${Math.round(p2pProgress)}%`,
+                          }}
+                        />
+                        <span className="progress-bar__label">
+                          {Math.round(p2pProgress)}%
+                        </span>
+                      </div>
+                    )}
+
+                    {p2pStatus === "preparing" && (
+                      <div className="progress-bar">
+                        <div className="progress-bar__fill progress-bar__fill--indeterminate" />
+                      </div>
+                    )}
+
+                    <button
+                      className="btn-ghost btn-full btn-sm"
+                      onClick={handleP2PCancel}>
+                      <IconX size={12} /> Cancel
+                    </button>
                   </div>
                 )}
               </div>

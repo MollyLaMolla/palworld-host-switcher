@@ -5,8 +5,18 @@
   "windows": ["main"],
   "permissions": [
     "core:default",
+    "core:event:default",
+    "core:event:allow-emit",
+    "core:event:allow-listen",
+    "core:webview:default",
+    "core:webview:allow-webview-close",
+    "core:webview:allow-webview-position",
+    "core:webview:allow-webview-size",
     "dialog:default",
     "dialog:allow-open",
-    "dialog:allow-save"
+    "dialog:allow-save",
+    "dialog:allow-ask",
+    "dialog:allow-confirm",
+    "dialog:allow-message"
   ]
 }

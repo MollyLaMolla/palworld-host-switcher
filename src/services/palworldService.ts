@@ -184,3 +184,47 @@ export async function importWorld(
     newName: newName ?? null,
   });
 }
+
+export async function isPalworldRunning(): Promise<boolean> {
+  return invoke<boolean>("is_palworld_running");
+}
+
+// ── P2P Transfer helpers ────────────────────────────
+
+export async function exportWorldToTemp(
+  accountId: string,
+  worldId: string,
+): Promise<string> {
+  return invoke<string>("export_world_to_temp", { accountId, worldId });
+}
+
+export async function getFileSize(path: string): Promise<number> {
+  return invoke<number>("get_file_size", { path });
+}
+
+export async function readFileChunk(
+  path: string,
+  offset: number,
+  length: number,
+): Promise<ArrayBuffer> {
+  return invoke<ArrayBuffer>("read_file_chunk", { path, offset, length });
+}
+
+export async function appendFileChunkB64(
+  path: string,
+  dataB64: string,
+): Promise<void> {
+  await invoke("append_file_chunk_b64", { path, dataB64 });
+}
+
+export async function getTempPath(filename: string): Promise<string> {
+  return invoke<string>("get_temp_path", { filename });
+}
+
+export async function deleteTempFile(path: string): Promise<void> {
+  await invoke("delete_temp_file", { path });
+}
+
+export async function extractZipToTemp(zipPath: string): Promise<string> {
+  return invoke<string>("extract_zip_to_temp", { zipPath });
+}
