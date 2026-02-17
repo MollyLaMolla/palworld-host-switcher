@@ -1,0 +1,242 @@
+# 🎮 Palworld Host Switcher
+
+A lightweight desktop application for managing **Palworld** dedicated/co-op save files.
+Swap host ownership, rename players, transfer worlds between machines, and create backups — all from a clean, modern UI without touching raw game files.
+
+![Tauri](https://img.shields.io/badge/Tauri-v2-blue?logo=tauri)
+![React](https://img.shields.io/badge/React-19-61dafb?logo=react)
+![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178c6?logo=typescript)
+![Rust](https://img.shields.io/badge/Rust-1.77+-orange?logo=rust)
+![Platform](https://img.shields.io/badge/Platform-Windows-0078d4?logo=windows)
+
+---
+
+## ✨ Features
+
+### Player Management
+
+- **Auto-detect accounts & worlds** — scans `%LOCALAPPDATA%\Pal\Saved\SaveGames` automatically
+- **Player list** with host indicator (crown icon) and player count
+- **Drag & drop player swap** — pointer-based reorder in Edit Mode to swap `.sav` files between slots
+- **Rename players** — assign friendly display names (stored in a JSON sidecar, never touches game files)
+- **Reset names** — bulk-reset all player names back to their original slot IDs
+- **Host slot selector** — manually assign which slot is the host
+
+### World Management
+
+- **World display names** — give each world a custom name shown in the UI (folder name stays unchanged)
+- **World transfer (Export)** — export an entire world as a `.zip` archive to share with others
+- **World transfer (Import)** — import a world from a folder or ZIP via file browser or drag & drop from the OS
+- **Conflict detection** — importing a world that already exists lets you choose to replace or create a copy with a new name
+
+### Backup System
+
+- **Create backups** — snapshot all player `.sav` files plus the full config state (host, names, display name)
+- **Restore backups** — restore any previous snapshot, overwriting current files
+- **Delete backups** — remove individual backups or wipe all at once
+- **Auto-backup** — optionally create a backup before every destructive operation (host swap, player swap)
+
+### UI / UX
+
+- **Dark theme** — modern dark interface with accent colors
+- **Resizable sidebar** — drag the divider to resize the sidebar
+- **Activity log** — collapsible console showing timestamped operation history
+- **Toast notifications** — non-blocking success/error/info popups
+- **Progress bars** — real-time progress for export and import operations (non-blocking, runs on background thread)
+- **Search** — filter players by name or ID
+
+---
+
+## 🏗️ Tech Stack
+
+| Layer           | Technology                | Purpose                                               |
+| --------------- | ------------------------- | ----------------------------------------------------- |
+| **Frontend**    | React 19 + TypeScript 5.9 | UI components, state management                       |
+| **Bundler**     | Vite 7                    | Dev server, HMR, production build                     |
+| **Backend**     | Rust (Tauri v2)           | File system operations, ZIP compression, IPC commands |
+| **Desktop**     | Tauri v2.10               | Native window, installer generation, OS drag & drop   |
+| **Dialogs**     | `tauri-plugin-dialog`     | Native file/folder pickers, confirm dialogs           |
+| **Compression** | `zip` crate (Rust)        | World export/import as `.zip`                         |
+| **File walk**   | `walkdir` crate           | Recursive directory traversal for export              |
+
+---
+
+## 📁 Project Structure
+
+```
+palworld-host-switcher/
+├── src/                          # Frontend (React + TypeScript)
+│   ├── App.tsx                   # Main component — all UI logic
+│   ├── App.css                   # Complete stylesheet (dark theme)
+│   └── services/
+│       └── palworldService.ts    # Tauri IPC invoke wrappers
+├── src-tauri/                    # Rust backend
+│   ├── src/lib.rs                # All Tauri commands & file logic
+│   ├── tauri.conf.json           # App config (window, bundle, etc.)
+│   ├── Cargo.toml                # Rust dependencies
+│   ├── icons/                    # Generated app icons (all sizes)
+│   └── capabilities/             # Tauri v2 permission capabilities
+├── public/                       # Static assets
+├── index.html                    # Entry point
+├── package.json                  # Node dependencies & scripts
+├── vite.config.ts                # Vite configuration
+└── .github/
+    └── copilot-instructions.md   # AI assistant instructions
+```
+
+---
+
+## 📦 Data Storage
+
+The app operates on Palworld's save game directory:
+
+```
+%LOCALAPPDATA%\Pal\Saved\SaveGames\
+  └── <SteamAccountID>/
+      └── <WorldID>/
+          ├── Players/
+          │   ├── 00000000000000000000000000000001.sav
+          │   ├── <PlayerID>.sav
+          │   ├── host_switcher.json    ← app config (per-world)
+          │   └── backup/
+          │       └── 2026-02-17_14-30-00/
+          │           ├── *.sav          ← backed up player files
+          │           └── config_snapshot.json
+          ├── LevelMeta.sav
+          └── Level.sav
+```
+
+### `host_switcher.json` (per-world config)
+
+Stored **inside the world folder**, so it travels with the world when exported/shared:
+
+```json
+{
+  "host_id": "00000000000000000000000000000001",
+  "players": {
+    "00000000000000000000000000000001": "Alex",
+    "612decda000000000000000000000000": "Sam"
+  },
+  "original_names": {
+    "00000000000000000000000000000001": "00000000000000000000000000000001",
+    "612decda000000000000000000000000": "612decda000000000000000000000000"
+  },
+  "display_name": "My Main World"
+}
+```
+
+---
+
+## 🚀 Getting Started
+
+### Prerequisites
+
+- **Node.js** ≥ 18 — [Download](https://nodejs.org/)
+- **Rust** ≥ 1.77 — [Install via rustup](https://rustup.rs/)
+- **Visual Studio Build Tools** (Windows) — C++ build tools required by Tauri ([Setup guide](https://tauri.app/start/prerequisites/))
+
+### Clone the Repository
+
+```bash
+git clone https://github.com/MollyLaMolla/palworld-host-switcher.git
+cd palworld-host-switcher
+```
+
+### Install Dependencies
+
+```bash
+npm install
+```
+
+### Run in Development Mode
+
+```bash
+npx tauri dev
+```
+
+This starts both the Vite dev server (with HMR) and the Tauri native window.
+
+### Build for Production
+
+```bash
+npx tauri build
+```
+
+Output installers are generated in:
+
+```
+src-tauri/target/release/bundle/
+  ├── msi/   → Palworld Host Switcher_0.1.0_x64_en-US.msi
+  └── nsis/  → Palworld Host Switcher_0.1.0_x64-setup.exe
+```
+
+Double-click either installer to install the app. It will appear in your Start Menu as **Palworld Host Switcher**.
+
+---
+
+## 🖥️ Usage
+
+1. **Launch the app** — double-click the installed app or run `npx tauri dev`
+2. **Select Account** — your Steam account ID is auto-detected from the sidebar dropdown
+3. **Select World** — pick the world you want to manage
+4. **Rename the world** _(optional)_ — click the ✏️ pencil icon above the player list to set a friendly name
+5. **View players** — all players with `.sav` files appear as cards
+6. **Swap players** — click **Edit**, then drag one player card onto another to swap their slot data
+7. **Rename players** — click the pencil icon on a player card to set a display name
+8. **Change host slot** — use the **Host slot** section in the sidebar to reassign host ownership
+9. **Backup / Restore** — use the sidebar Backup section before making changes
+10. **Export / Import world** — use the sidebar World Transfer section to share worlds as ZIP files
+
+---
+
+## 🐛 Known Issues & Resolutions
+
+| Issue                                                       | Root Cause                                                                                     | Resolution                                                                                        |
+| ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| Export freezes the UI                                       | ZIP compression ran on the main thread, blocking the event loop                                | Moved to `tauri::async_runtime::spawn_blocking()` with progress events throttled to ≥ 2% changes  |
+| Drag-and-drop for file import breaks player swap drag       | Tauri's `dragDropEnabled: true` intercepts ALL drag events via OLE handler, blocking HTML5 DnD | Replaced HTML5 drag events with **pointer events** (`onPointerDown/Move/Up`) for player swaps     |
+| Drag-dropped import doesn't detect existing world conflicts | `onDragDropEvent` closure captures stale `accountId` (empty deps `[]`)                         | Added `accountIdRef` (useRef) to always read the current value in async callbacks                 |
+| Player names lost after world import                        | UI didn't refresh players/backups after import when `worldId` stayed the same                  | Explicitly re-fetch players, host slot, and backups after successful import                       |
+| Nested folder detection for imports                         | Users often zip the world inside an extra parent folder                                        | `validate_world_folder` auto-detects and resolves same-name subfolder or single-subfolder nesting |
+| Backup didn't preserve world display name                   | `BackupSnapshot` didn't include `display_name`                                                 | Added `display_name` to snapshot with `#[serde(default)]` for backward compatibility              |
+
+---
+
+## 🔧 Backend Commands (IPC)
+
+All commands exposed via `tauri::generate_handler!`:
+
+| Command                                                 | Description                                                  |
+| ------------------------------------------------------- | ------------------------------------------------------------ |
+| `get_accounts`                                          | List Steam account IDs from SaveGames folder                 |
+| `get_worlds` / `get_worlds_with_counts`                 | List worlds with player counts and display names             |
+| `get_players`                                           | List players with names, host status, original IDs           |
+| `set_host_player`                                       | Swap a player into the host slot (swaps `.sav` files)        |
+| `swap_players`                                          | Swap two players' slot data and files                        |
+| `set_host_slot`                                         | Set which slot ID is considered host (config only)           |
+| `set_player_name` / `reset_player_names`                | Rename a player / reset all names to slot IDs                |
+| `set_world_name` / `reset_world_name`                   | Set or clear a world's display name                          |
+| `create_backup` / `restore_backup`                      | Create or restore a full snapshot                            |
+| `list_backups` / `delete_backup` / `delete_all_backups` | Manage backup history                                        |
+| `export_world`                                          | Export world as `.zip` (async, with progress events)         |
+| `validate_world_folder`                                 | Validate a folder structure as a valid Palworld world        |
+| `check_world_exists`                                    | Check if a world name already exists under an account        |
+| `import_world`                                          | Import a world folder (replace or copy, async with progress) |
+| `rescan_storage`                                        | Force re-scan of the SaveGames directory                     |
+
+---
+
+## 📄 License
+
+This project is provided as-is for personal use.
+Palworld is a trademark of Pocketpair, Inc. This tool is not affiliated with or endorsed by Pocketpair.
+
+---
+
+## 🤝 Contributing
+
+1. Fork the repository
+2. Create a feature branch: `git checkout -b feature/my-feature`
+3. Commit your changes: `git commit -m "Add my feature"`
+4. Push to the branch: `git push origin feature/my-feature`
+5. Open a Pull Request
