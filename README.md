@@ -306,6 +306,9 @@ Double-click either installer to install the app. It will appear in your Start M
 | UI freezes during scanning / swapping                       | Heavy GVAS parsing ran on the Tauri main thread                                                | All heavy commands (`get_players`, `swap_players`, `set_host_player`, `restore_backup`) use `spawn_blocking` |
 | Unnecessary swaps when reordering many players              | Each adjacent drag was counted as a separate swap                                              | Net-diff algorithm computes the minimum permutation difference using greedy cycle decomposition   |
 | TAO window-manager warnings flooding console                | `tao` crate emitting debug messages about unhandled WM events                                  | Added `tauri_plugin_log` filter: `.filter(\|m\| !m.target().starts_with("tao::"))`              |
+| Player Level and Pals count always 0                        | `decode_character_rawdata` double-wrapped `SaveParameter`, making properties unreachable at the expected JSON path | Flattened decoder output to `{"object": props}` directly; updated encoder to match              |
+| Level field not parsed from ByteProperty                    | `Level` is a `ByteProperty` with double-nested value (`{value:{type,value}}`), code only did one `.get("value")` | Changed extraction to `.get("value").get("value").as_u64()` to reach the inner numeric value   |
+| Last Seen always showing "Online now"                       | `GameTimeSaveData` was in the `is_skip_path` list, stored as raw blob instead of parsed JSON    | Removed from skip list so `RealDateTimeTicks` is parsed and `current_ticks` reads correctly     |
 
 ---
 

@@ -437,9 +437,10 @@ fn extract_players_from_level(world_path: &Path) -> Result<Vec<LevelPlayerInfo>,
           .unwrap_or(false);
 
         if is_player {
-          // This is a player character
+          // Level is a ByteProperty: {"value": {"type":"None","value":55}}
           let level = save_param
             .get("Level")
+            .and_then(|v| v.get("value"))
             .and_then(|v| v.get("value"))
             .and_then(|v| v.as_u64())
             .unwrap_or(1) as u32;

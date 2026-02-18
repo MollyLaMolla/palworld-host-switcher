@@ -293,7 +293,6 @@ fn is_skip_path(path: &str) -> bool {
         "DungeonPointMarkerSaveData",
         "OilrigSaveData",
         "InvaderSaveData",
-        "GameTimeSaveData",
         "WorkerDirectorSaveData",
         "GuildExtraSaveDataMap",
         "CharacterParameterStorageSaveData",
@@ -1312,14 +1311,14 @@ fn decode_character_rawdata(data: &[u8]) -> Result<Value, String> {
         let mut trail = [0u8; 4];
         cur.read_exact(&mut trail).map_err(|e| e.to_string())?;
         Ok(json!({
-            "object": {"SaveParameter": { "struct_type": "PalIndividualCharacterSaveParameter", "value": props }},
+            "object": Value::Object(props),
             "unknown_bytes": unknown.to_vec(),
             "group_id": group_id,
             "trailing_bytes": trail.to_vec()
         }))
     } else {
         Ok(json!({
-            "object": {"SaveParameter": { "struct_type": "PalIndividualCharacterSaveParameter", "value": props }},
+            "object": Value::Object(props),
             "unknown_bytes": [],
             "group_id": "00000000-0000-0000-0000-000000000000",
             "trailing_bytes": remaining.to_vec()
@@ -2220,12 +2219,12 @@ fn encode_group_rawdata(val: &Value, group_type: &str) -> Result<Vec<u8>, String
 // ── Character rawdata encoder ──
 
 fn encode_character_rawdata(val: &Value) -> Result<Vec<u8>, String> {
-    let sp_value = &val["object"]["SaveParameter"]["value"];
+    let obj = val["object"]
+        .as_object()
+        .ok_or("character rawdata missing 'object'")?;
 
     let mut writer = GvasWriter::new();
-    if let Some(obj) = sp_value.as_object() {
-        writer.write_properties(obj)?;
-    }
+    writer.write_properties(obj)?;
 
     let unknown = val["unknown_bytes"].as_array().unwrap_or_else(|| &EMPTY_VEC);
     for b in unknown {
