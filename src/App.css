@@ -778,47 +778,288 @@ button:hover:not(:disabled) {
   border: 1px solid var(--border);
 }
 
-/* ── Player edit row ───────────────────────────────────── */
+/* ── Player details row ────────────────────────────────── */
 
-.player-edit {
+.player-details {
   display: flex;
-  gap: 4px;
-  margin-top: 4px;
-  animation: slideDown 120ms ease-out;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 2px;
 }
 
-.player-edit-toggle {
-  padding: 1px 4px !important;
-  font-size: 0.68rem !important;
-  opacity: 0.35;
-  transition: opacity 150ms;
-  border-radius: 4px !important;
-  flex-shrink: 0;
-}
-
-.player-card:hover .player-edit-toggle {
-  opacity: 0.7;
-}
-
-.player-edit-toggle:hover {
-  opacity: 1 !important;
-}
-
-.player-edit input {
-  flex: 1;
-  min-width: 0;
-  background: var(--bg-input);
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  padding: 3px 7px;
-  font-size: 0.75rem;
-  color: var(--text);
+.player-detail {
+  font-size: 0.68rem;
+  color: var(--text-secondary);
+  white-space: nowrap;
 }
 
 .empty-msg {
   color: var(--text-tertiary);
   font-size: 0.8rem;
   padding: 6px 0;
+}
+
+/* ── Homepage / Welcome ───────────────────────────────── */
+
+.homepage {
+  flex: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 40px 24px;
+  overflow-y: auto;
+}
+
+.homepage__card {
+  max-width: 520px;
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 16px;
+  text-align: center;
+}
+
+.homepage__icon {
+  width: 80px;
+  height: 80px;
+  border-radius: 20px;
+  background: var(--accent-muted);
+  display: grid;
+  place-items: center;
+  color: var(--accent);
+  margin-bottom: 4px;
+}
+
+.homepage__title {
+  font-size: 1.2rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.homepage__desc {
+  font-size: 0.85rem;
+  color: var(--text-secondary);
+  line-height: 1.6;
+  max-width: 420px;
+}
+
+.homepage__steps {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  width: 100%;
+  margin-top: 8px;
+}
+
+.homepage__step {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  text-align: left;
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 12px 14px;
+}
+
+.homepage__step strong {
+  font-size: 0.82rem;
+  color: var(--text);
+}
+
+.homepage__step p {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  margin-top: 2px;
+}
+
+.homepage__step-num {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  background: var(--accent-muted);
+  color: var(--accent);
+  font-weight: 700;
+  font-size: 0.78rem;
+  display: grid;
+  place-items: center;
+  flex-shrink: 0;
+}
+
+.homepage__hint {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.75rem;
+  color: var(--text-tertiary);
+  margin-top: 6px;
+}
+
+/* ── Scanning overlay ──────────────────────────────────── */
+
+.scanning-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 900;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  background: rgba(10, 12, 16, 0.65);
+  backdrop-filter: blur(10px);
+  -webkit-backdrop-filter: blur(10px);
+  animation: scanning-fade-in 250ms ease-out;
+}
+
+@keyframes scanning-fade-in {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+.scanning-overlay__spinner {
+  width: 44px;
+  height: 44px;
+  border: 3px solid rgba(255, 255, 255, 0.12);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 600ms linear infinite;
+}
+
+.scanning-overlay__title {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text);
+}
+
+.scanning-overlay__desc {
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  text-align: center;
+  max-width: 280px;
+}
+
+/* ── Progress bar (used in export/import/P2P overlays) ── */
+
+.progress-bar {
+  width: 220px;
+  height: 6px;
+  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.1);
+  overflow: hidden;
+  margin-top: 4px;
+}
+
+.progress-bar__fill {
+  height: 100%;
+  border-radius: 3px;
+  background: var(--accent);
+  transition: width 300ms ease;
+}
+
+.progress-bar__label {
+  font-size: 0.75rem;
+  color: var(--text-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Overlay percentage label ─────────────────────────── */
+
+.scanning-overlay__pct {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.5px;
+}
+
+/* ── Swap steps list (saving overlay) ─────────────────── */
+
+.swap-steps {
+  list-style: none;
+  margin: 4px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  max-height: 180px;
+  overflow-y: auto;
+}
+
+.swap-step {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.82rem;
+  color: var(--text-secondary);
+  opacity: 0.5;
+  transition: opacity 200ms, color 200ms;
+  padding: 3px 10px;
+  border-radius: 4px;
+  background: rgba(255, 255, 255, 0.03);
+}
+
+.swap-step--active {
+  opacity: 1;
+  color: var(--accent);
+  background: rgba(99, 102, 241, 0.08);
+}
+
+.swap-step--done {
+  opacity: 0.8;
+  color: var(--success, #4caf50);
+}
+
+.swap-step__icon {
+  width: 16px;
+  text-align: center;
+  font-size: 0.75rem;
+  flex-shrink: 0;
+}
+
+.swap-step__names {
+  font-weight: 500;
+  max-width: 100px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.swap-step__arrow {
+  opacity: 0.5;
+  font-size: 0.7rem;
+  flex-shrink: 0;
+}
+
+/* ── Scan error ───────────────────────────────────────── */
+
+.scan-error {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 40px 24px;
+  text-align: center;
+  color: var(--danger);
+}
+
+.scan-error h3 {
+  font-size: 0.95rem;
+  font-weight: 600;
+}
+
+.scan-error p {
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  max-width: 400px;
+  word-break: break-word;
 }
 
 /* ── Drag-and-drop swap ───────────────────────────────── */
@@ -1585,4 +1826,102 @@ button:hover:not(:disabled) {
   50% {
     border-color: rgba(234, 158, 62, 0.4);
   }
+}
+
+/* ── Settings modal ──────────────────────────── */
+.settings-modal {
+  background: var(--bg-raised);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  width: 520px;
+  max-width: 92vw;
+  max-height: 85vh;
+  display: flex;
+  flex-direction: column;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.6);
+  animation: modal-scale-in 150ms ease-out;
+}
+
+.settings-modal__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 18px 22px 14px;
+  border-bottom: 1px solid var(--border);
+}
+.settings-modal__header h2 {
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+}
+
+.settings-modal__body {
+  padding: 20px 22px 24px;
+  overflow-y: auto;
+}
+
+/* ── Settings section ────────────────────────── */
+.settings-section {
+  margin-bottom: 24px;
+}
+.settings-section:last-child {
+  margin-bottom: 0;
+}
+.settings-section__title {
+  font-size: 0.88rem;
+  font-weight: 600;
+  color: var(--text);
+  margin: 0 0 6px;
+}
+.settings-section__desc {
+  font-size: 0.78rem;
+  color: var(--text-dim);
+  line-height: 1.55;
+  margin: 0 0 10px;
+}
+.settings-section__desc code {
+  background: rgba(255, 255, 255, 0.06);
+  padding: 1px 5px;
+  border-radius: 4px;
+  font-size: 0.78rem;
+}
+.settings-section__path {
+  display: block;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  font-size: 0.75rem;
+  color: var(--text-dim);
+  margin-bottom: 14px;
+  word-break: break-all;
+  font-family: "Cascadia Code", "Fira Code", monospace;
+}
+
+/* ── Oodle status badge ──────────────────────── */
+.settings-oodle-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 14px;
+  flex-wrap: wrap;
+}
+.settings-oodle-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 12px;
+  border-radius: 20px;
+  font-size: 0.75rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.settings-oodle-badge--ok {
+  background: rgba(46, 204, 113, 0.15);
+  color: #2ecc71;
+  border: 1px solid rgba(46, 204, 113, 0.3);
 }

@@ -3,7 +3,7 @@
 A lightweight desktop application for managing **Palworld** dedicated/co-op save files.
 Swap host ownership, rename players, transfer worlds between machines, share worlds peer-to-peer, and create backups — all from a clean, modern UI without touching raw game files.
 
-![Tauri](https://img.shields.io/badge/Tauri-v2-blue?logo=tauri)
+![Tauri](https://img.shields.io/badge/Tauri-v2.10-blue?logo=tauri)
 ![React](https://img.shields.io/badge/React-19-61dafb?logo=react)
 ![TypeScript](https://img.shields.io/badge/TypeScript-5.9-3178c6?logo=typescript)
 ![Rust](https://img.shields.io/badge/Rust-1.77+-orange?logo=rust)
@@ -16,11 +16,12 @@ Swap host ownership, rename players, transfer worlds between machines, share wor
 ### Player Management
 
 - **Auto-detect accounts & worlds** — scans `%LOCALAPPDATA%\Pal\Saved\SaveGames` automatically
-- **Player list** with host indicator (crown icon) and player count
+- **Player list** with host indicator (crown icon), player level, pal count, guild name, and last-seen timestamp
 - **Drag & drop player swap** — pointer-based reorder in Edit Mode to swap `.sav` files between slots
+- **Net-diff swap optimization** — uses a greedy permutation algorithm to compute the minimum number of swaps required to reach the desired arrangement; cycles of length 1 are skipped, and each multi-element cycle uses only `len − 1` swaps
 - **Rename players** — assign friendly display names (stored in a JSON sidecar, never touches game files)
 - **Reset names** — bulk-reset all player names back to their original slot IDs
-- **Host slot selector** — manually assign which slot is the host
+- **Automatic host detection** — host is always slot `000…001`; no manual selection required
 
 ### World Management
 
@@ -29,6 +30,19 @@ Swap host ownership, rename players, transfer worlds between machines, share wor
 - **World transfer (Import)** — import a world from a folder or ZIP via file browser or drag & drop from the OS
 - **Conflict detection** — importing a world that already exists lets you choose to replace or create a copy with a new name
 - **Smart import merge** — when replacing an existing world, backups from both the existing and imported world are preserved and merged together
+
+### GVAS Save Parser (Pure Rust)
+
+The application includes a **complete, zero-dependency GVAS parser** (Unreal Engine 4/5 binary save format) implemented entirely in Rust (~2 400 lines). This is used to read and modify `Level.sav` and individual player `.sav` files.
+
+- **Full round-trip** — parse `.sav` → JSON → `.sav` with bit-perfect output
+- **All GVAS property types** — `BoolProperty`, `IntProperty`, `Int64Property`, `FloatProperty`, `DoubleProperty`, `StrProperty`, `NameProperty`, `TextProperty`, `EnumProperty`, `StructProperty`, `ArrayProperty`, `MapProperty`, `SetProperty`, `SoftObjectProperty`, `ObjectProperty`
+- **Struct sub-types** — `Guid`, `DateTime`, `Timespan`, `Vector`, `Quat`, `LinearColor`, `Rotator`, and generic key-value structs
+- **Compression** — transparent handling of PLZ (double-zlib) and PLM (Oodle) compressed saves
+- **Player extraction from Level.sav** — reads `CharacterSaveParameterMap` and `GroupSaveDataMap` to extract player name, level, pal count, guild name, last-online ticks, and ownership UIDs
+- **Deep UID swap** — bidirectional UUID swap across `CharacterSaveParameterMap`, `GroupSaveDataMap`, ownership fields, and the full JSON tree via `deep_swap_uids`
+- **Player .sav patching** — `modify_player_sav` rewrites the `PlayerUId` and `IndividualId.PlayerUId` inside each player's personal save file
+- **4 unit tests** — `test_plz_roundtrip`, `test_decompress_level_sav`, `test_parse_level_sav_to_json`, `test_roundtrip_level_sav`
 
 ### P2P World Transfer
 
@@ -57,10 +71,13 @@ Swap host ownership, rename players, transfer worlds between machines, share wor
 - **Dark theme** — modern dark interface with accent colors
 - **Splash screen** — instant dark splash loader prevents white flash on startup
 - **Game-running safety lock** — detects if Palworld is running and blocks all operations with a full-screen overlay to prevent save corruption
+- **Non-blocking heavy operations** — all save parsing, swap, and restore commands run on a background thread via `spawn_blocking` to keep the UI responsive
+- **Real-time swap progress** — granular progress events emitted from Rust at ~10 stages per swap (read → parse → modify UIDs → serialize → write Level.sav → patch player .savs → rename files); displayed as a percentage and per-step checklist in the overlay
+- **Scanning overlay** — spinner + message while Level.sav is being read (no fake progress bar)
 - **Resizable sidebar** — drag the divider to resize the sidebar
 - **Activity log** — collapsible console showing timestamped operation history
 - **Toast notifications** — non-blocking success/error/info popups
-- **Progress bars** — real-time progress for export, import, and P2P transfer operations (non-blocking, runs on background thread)
+- **Progress bars** — real-time progress for export, import, and P2P transfer operations
 - **Search** — filter players by name or ID
 - **Rescan** — manually re-scan the save folder to pick up external changes (added/deleted worlds)
 
@@ -72,13 +89,16 @@ Swap host ownership, rename players, transfer worlds between machines, share wor
 | --------------- | ------------------------- | ----------------------------------------------------- |
 | **Frontend**    | React 19 + TypeScript 5.9 | UI components, state management                       |
 | **Bundler**     | Vite 7                    | Dev server, HMR, production build                     |
-| **Backend**     | Rust (Tauri v2)           | File system operations, ZIP compression, IPC commands |
+| **Backend**     | Rust (Tauri v2)           | File system operations, GVAS parsing, ZIP, IPC        |
 | **Desktop**     | Tauri v2.10               | Native window, installer generation, OS drag & drop   |
+| **Save parser** | Custom GVAS module (Rust) | Unreal Engine .sav read/write, UID swaps, Level.sav   |
+| **Compression** | zlib (flate2) + Oodle FFI | PLZ double-zlib and PLM Oodle decompression           |
 | **Dialogs**     | `tauri-plugin-dialog`     | Native file/folder pickers, confirm dialogs           |
-| **Compression** | `zip` crate (Rust)        | World export/import as `.zip`                         |
+| **ZIP**         | `zip` crate (Rust)        | World export/import as `.zip`                         |
 | **File walk**   | `walkdir` crate           | Recursive directory traversal for export              |
 | **P2P**         | PeerJS (WebRTC)           | Direct peer-to-peer world transfer between PCs        |
 | **TURN relay**  | Metered.ca API            | TURN credentials for NAT traversal (free 50 GB/month) |
+| **Logging**     | `tauri-plugin-log`        | Structured log output with target-based filtering     |
 
 ---
 
@@ -87,21 +107,32 @@ Swap host ownership, rename players, transfer worlds between machines, share wor
 ```
 palworld-host-switcher/
 ├── src/                          # Frontend (React + TypeScript)
-│   ├── App.tsx                   # Main component — all UI logic
-│   ├── App.css                   # Complete stylesheet (dark theme)
+│   ├── App.tsx                   # Main component — all UI logic (~2 500 lines)
+│   ├── App.css                   # Complete stylesheet, dark theme (~1 900 lines)
+│   ├── index.css                 # Base/reset styles
+│   ├── main.tsx                  # React entry point
 │   └── services/
 │       ├── palworldService.ts    # Tauri IPC invoke wrappers
 │       └── p2pService.ts         # WebRTC P2P file transfer (PeerJS)
 ├── src-tauri/                    # Rust backend
-│   ├── src/lib.rs                # All Tauri commands & file logic
-│   ├── tauri.conf.json           # App config (window, bundle, etc.)
+│   ├── src/
+│   │   ├── lib.rs                # Tauri commands & file logic (~1 660 lines)
+│   │   ├── gvas.rs               # GVAS save parser / serializer (~2 430 lines)
+│   │   ├── oodle.rs              # Oodle DLL FFI wrapper for PLM saves
+│   │   └── main.rs               # Binary entry point
+│   ├── tauri.conf.json           # App config (window, bundle, permissions)
 │   ├── Cargo.toml                # Rust dependencies
+│   ├── build.rs                  # Cargo build script
 │   ├── icons/                    # Generated app icons (all sizes)
 │   └── capabilities/             # Tauri v2 permission capabilities
 ├── public/                       # Static assets
-├── index.html                    # Entry point (includes splash loader)
+├── index.html                    # Entry point (includes inline splash loader)
 ├── package.json                  # Node dependencies & scripts
 ├── vite.config.ts                # Vite configuration
+├── tsconfig.json                 # TypeScript config (project references)
+├── tsconfig.app.json             # TypeScript config for app sources
+├── tsconfig.node.json            # TypeScript config for Vite/node
+├── eslint.config.js              # ESLint flat config
 └── .github/
     └── copilot-instructions.md   # AI assistant instructions
 ```
@@ -243,14 +274,13 @@ Double-click either installer to install the app. It will appear in your Start M
 3. **Select Account** — your Steam account ID is auto-detected from the sidebar dropdown
 4. **Select World** — pick the world you want to manage
 5. **Rename the world** _(optional)_ — click the ✏️ pencil icon above the player list to set a friendly name
-6. **View players** — all players with `.sav` files appear as cards
-7. **Swap players** — click **Edit**, then drag one player card onto another to swap their slot data
+6. **View players** — all players with `.sav` files appear as cards showing name, level, pal count, guild, and last-seen time
+7. **Swap players** — click **Edit**, then drag player cards to rearrange; click **Save** to apply the minimal set of swaps computed by the net-diff algorithm
 8. **Rename players** — click the pencil icon on a player card to set a display name
-9. **Change host slot** — use the **Host slot** section in the sidebar to reassign host ownership
-10. **Backup / Restore** — use the sidebar Backup section before making changes
-11. **Export / Import world** — use the sidebar World Transfer section to share worlds as ZIP files
-12. **P2P Transfer** — share a world directly with another PC: click **Share** to get a code, or enter a code to **Receive**
-13. **Rescan** — click the Rescan button to refresh if you've made changes outside the app
+9. **Backup / Restore** — use the sidebar Backup section before making changes
+10. **Export / Import world** — use the sidebar World Transfer section to share worlds as ZIP files
+11. **P2P Transfer** — share a world directly with another PC: click **Share** to get a code, or enter a code to **Receive**
+12. **Rescan** — click the Rescan button to refresh if you've made changes outside the app
 
 ---
 
@@ -271,6 +301,11 @@ Double-click either installer to install the app. It will appear in your Start M
 | Rescan doesn't detect deleted worlds                        | Rescan only refreshed accounts, didn't cascade re-fetch worlds/players/backups                 | Rescan now fully re-loads accounts → worlds → players → backups from disk                         |
 | P2P transfer times out between different networks           | Only STUN servers configured; STUN fails with symmetric NAT / CGNAT / mobile networks          | Integrated Metered.ca TURN relay with automatic credential fetching and 10-min caching            |
 | P2P fails silently with no relay candidates                 | Free Open Relay Project servers had invalid/expired credentials                                | Replaced with Metered.ca API; each user configures their own account; Test TURN button to verify  |
+| `json_to_sav` produces corrupted files                      | Size field written included the header bytes, causing the game to reject the file              | Fixed `write_property_inner` to return only the data-only size; header written by the caller      |
+| Host detection wrong after swaps                            | Config-based host ID drifted when `.sav` files were renamed                                    | Host is now always the player whose filename is slot `000…001`; no config needed                  |
+| UI freezes during scanning / swapping                       | Heavy GVAS parsing ran on the Tauri main thread                                                | All heavy commands (`get_players`, `swap_players`, `set_host_player`, `restore_backup`) use `spawn_blocking` |
+| Unnecessary swaps when reordering many players              | Each adjacent drag was counted as a separate swap                                              | Net-diff algorithm computes the minimum permutation difference using greedy cycle decomposition   |
+| TAO window-manager warnings flooding console                | `tao` crate emitting debug messages about unhandled WM events                                  | Added `tauri_plugin_log` filter: `.filter(\|m\| !m.target().starts_with("tao::"))`              |
 
 ---
 
@@ -278,29 +313,28 @@ Double-click either installer to install the app. It will appear in your Start M
 
 All commands exposed via `tauri::generate_handler!`:
 
-| Command                                                 | Description                                                |
-| ------------------------------------------------------- | ---------------------------------------------------------- |
-| `get_accounts`                                          | List Steam account IDs from SaveGames folder               |
-| `get_worlds` / `get_worlds_with_counts`                 | List worlds with player counts and display names           |
-| `get_players`                                           | List players with names, host status, original IDs         |
-| `set_host_player`                                       | Swap a player into the host slot (swaps `.sav` files)      |
-| `swap_players`                                          | Swap two players' slot data and files                      |
-| `set_host_slot`                                         | Set which slot ID is considered host (config only)         |
-| `set_player_name` / `reset_player_names`                | Rename a player / reset all names to slot IDs              |
-| `set_world_name` / `reset_world_name`                   | Set or clear a world's display name                        |
-| `create_backup` / `restore_backup`                      | Create or restore a full snapshot                          |
-| `list_backups` / `delete_backup` / `delete_all_backups` | Manage backup history                                      |
-| `export_world`                                          | Export world as `.zip` (async, with progress events)       |
-| `validate_world_folder`                                 | Validate a folder structure as a valid Palworld world      |
-| `check_world_exists`                                    | Check if a world name already exists under an account      |
-| `import_world`                                          | Import a world folder (replace or copy, with backup merge) |
-| `rescan_storage`                                        | Force re-scan of the SaveGames directory                   |
-| `is_palworld_running`                                   | Detect if Palworld is running (silent, no console window)  |
-| `export_world_to_temp`                                  | Export world to a temp ZIP for P2P sharing                 |
-| `get_file_size` / `read_file_chunk`                     | Read binary file data in chunks (for P2P transfer)         |
-| `append_file_chunk_b64`                                 | Append base64-encoded chunk to a file (P2P receiver)       |
-| `get_temp_path` / `delete_temp_file`                    | Manage temporary files                                     |
-| `extract_zip_to_temp`                                   | Extract a received ZIP to a temp folder for validation     |
+| Command                                                 | Description                                                        |
+| ------------------------------------------------------- | ------------------------------------------------------------------ |
+| `get_accounts`                                          | List Steam account IDs from SaveGames folder                       |
+| `get_worlds` / `get_worlds_with_counts`                 | List worlds with player counts and display names                   |
+| `get_players`                                           | List players with name, level, pals, guild, last-seen (async)      |
+| `set_host_player`                                       | Swap a player into host slot `000…001` (modifies Level.sav + .savs)|
+| `swap_players`                                          | Swap two players' slot data (Level.sav + .sav files, with progress)|
+| `set_player_name` / `reset_player_names`                | Rename a player / reset all names to slot IDs                      |
+| `set_world_name` / `reset_world_name`                   | Set or clear a world's display name                                |
+| `create_backup` / `restore_backup`                      | Create or restore a full snapshot (async for restore)              |
+| `list_backups` / `delete_backup` / `delete_all_backups` | Manage backup history                                              |
+| `export_world`                                          | Export world as `.zip` (async, with progress events)               |
+| `validate_world_folder`                                 | Validate a folder structure as a valid Palworld world              |
+| `check_world_exists`                                    | Check if a world name already exists under an account              |
+| `import_world`                                          | Import a world folder (replace or copy, with backup merge)         |
+| `rescan_storage`                                        | Force re-scan of the SaveGames directory                           |
+| `is_palworld_running`                                   | Detect if Palworld is running (silent, no console window)          |
+| `export_world_to_temp`                                  | Export world to a temp ZIP for P2P sharing                         |
+| `get_file_size` / `read_file_chunk`                     | Read binary file data in chunks (for P2P transfer)                 |
+| `append_file_chunk_b64`                                 | Append base64-encoded chunk to a file (P2P receiver)               |
+| `get_temp_path` / `delete_temp_file`                    | Manage temporary files                                             |
+| `extract_zip_to_temp`                                   | Extract a received ZIP to a temp folder for validation             |
 
 ---
 

@@ -5,6 +5,10 @@ export type Player = {
   name: string;
   originalId: string;
   isHost: boolean;
+  level: number;
+  palsCount: number;
+  lastOnline: string;
+  guildName: string;
 };
 
 export type WorldInfo = {
@@ -40,35 +44,6 @@ export async function setHostPlayer(
   playerId: string,
 ): Promise<Player[]> {
   return invoke<Player[]>("set_host_player", { accountId, worldId, playerId });
-}
-
-export async function setHostSlot(
-  accountId: string,
-  worldId: string,
-  hostId: string,
-): Promise<Player[]> {
-  return invoke<Player[]>("set_host_slot", { accountId, worldId, hostId });
-}
-
-export async function setPlayerName(
-  accountId: string,
-  worldId: string,
-  playerId: string,
-  name: string,
-): Promise<Player[]> {
-  return invoke<Player[]>("set_player_name", {
-    accountId,
-    worldId,
-    playerId,
-    name,
-  });
-}
-
-export async function resetPlayerNames(
-  accountId: string,
-  worldId: string,
-): Promise<Player[]> {
-  return invoke<Player[]>("reset_player_names", { accountId, worldId });
 }
 
 export async function swapPlayers(

@@ -1,4 +1,8 @@
+mod gvas;
+mod oodle;
+
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Seek, Write};
@@ -8,7 +12,11 @@ use tauri::{AppHandle, Emitter, Manager};
 use walkdir::WalkDir;
 use zip::write::SimpleFileOptions;
 
-const DEFAULT_HOST_ID: &str = "00000000000000000000000000000001";
+/// The host slot UUID in Palworld co-op, formatted for file names.
+/// FGuid{1,0,0,0} → "00000001000000000000000000000000"
+const DEFAULT_HOST_ID: &str = "00000001000000000000000000000000";
+/// Legacy host ID format (some older saves may use this).
+const LEGACY_HOST_ID: &str = "00000000000000000000000000000001";
 /// Name of the per-world config file stored inside each world's Players folder.
 /// Travels with the world files when shared between users.
 const WORLD_CONFIG_FILE: &str = "host_switcher.json";
@@ -45,13 +53,17 @@ struct AppConfig {
   worlds: HashMap<String, WorldConfig>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
 struct Player {
   id: String,
   name: String,
   original_id: String,
   is_host: bool,
+  level: u32,
+  pals_count: usize,
+  last_online: String,
+  guild_name: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -188,6 +200,7 @@ fn save_world_config(pdir: &Path, wc: &WorldConfig) -> Result<(), String> {
 }
 
 /// Prune stale player entries from WorldConfig that no longer have .sav files.
+#[allow(dead_code)]
 fn prune_world_config(wc: &mut WorldConfig, live_ids: &[String]) {
   wc.players.retain(|id, _| live_ids.contains(id));
   wc.original_names.retain(|id, _| live_ids.contains(id));
@@ -276,6 +289,34 @@ fn is_hex_id(value: &str) -> bool {
   value.len() == 32 && value.chars().all(|c| c.is_ascii_hexdigit())
 }
 
+/// Convert a GVAS UUID (with dashes) to a Palworld .sav filename (flat hex).
+fn uuid_to_filename(uuid: &str) -> String {
+  uuid.replace('-', "").to_ascii_lowercase()
+}
+
+/// Convert a flat-hex filename to a GVAS UUID (with dashes).
+fn filename_to_uuid(filename: &str) -> String {
+  let s = filename.to_ascii_lowercase();
+  if s.len() != 32 {
+    return s;
+  }
+  format!(
+    "{}-{}-{}-{}-{}",
+    &s[0..8],
+    &s[8..12],
+    &s[12..16],
+    &s[16..20],
+    &s[20..32]
+  )
+}
+
+/// Check if a player ID (flat hex) is the host slot.
+#[allow(dead_code)]
+fn is_host_slot(id: &str) -> bool {
+  let n = normalize_id(id);
+  n == DEFAULT_HOST_ID || n == LEGACY_HOST_ID
+}
+
 fn list_player_ids(players_dir: &Path) -> Vec<String> {
   fs::read_dir(players_dir)
     .ok()
@@ -290,66 +331,428 @@ fn list_player_ids(players_dir: &Path) -> Vec<String> {
     .collect()
 }
 
-fn resolve_host_id(wc: &WorldConfig, player_ids: &[String]) -> Option<String> {
-  if let Some(host_id) = &wc.host_id {
-    let normalized = normalize_id(host_id);
+fn resolve_host_id(_wc: &WorldConfig, player_ids: &[String]) -> Option<String> {
+  // Host is always the player in the well-known slot 0001.
+  for &hid in &[DEFAULT_HOST_ID, LEGACY_HOST_ID] {
+    let normalized = normalize_id(hid);
     if player_ids.contains(&normalized) {
       return Some(normalized);
     }
   }
-  let default_host = normalize_id(DEFAULT_HOST_ID);
-  if player_ids.contains(&default_host) {
-    return Some(default_host);
-  }
   player_ids.first().cloned()
 }
 
+// ── Level.sav player extraction ──────────────────────────
+
+/// Information extracted from Level.sav about a single player.
+#[allow(dead_code)]
+struct LevelPlayerInfo {
+  uuid: String,      // GVAS UUID with dashes
+  filename: String,   // flat hex for .sav filename
+  name: String,
+  level: u32,
+  pals_count: usize,
+  last_online: String,
+  guild_name: String,
+}
+
+/// Read Level.sav and extract player info (name, level, pals, etc.).
+fn extract_players_from_level(world_path: &Path) -> Result<Vec<LevelPlayerInfo>, String> {
+  let level_sav = world_path.join("Level.sav");
+  if !level_sav.exists() {
+    return Err("Level.sav not found.".into());
+  }
+  let data = fs::read(&level_sav).map_err(|e| format!("Cannot read Level.sav: {e}"))?;
+  let (json, _save_type) = gvas::sav_to_json(&data)?;
+
+  let world_data = &json["properties"]["worldSaveData"]["value"];
+
+  // ── 1. Extract guild info from GroupSaveDataMap ──
+  // Maps: player_uuid → (player_name, last_online_ticks, guild_name)
+  let mut guild_info: HashMap<String, (String, i64, String)> = HashMap::new();
+
+  if let Some(gsm) = world_data.get("GroupSaveDataMap") {
+    if let Some(entries) = gsm.get("value").and_then(|v| v.as_array()) {
+      for entry in entries {
+        let group_type = entry
+          .pointer("/value/GroupType/value/value")
+          .and_then(|v| v.as_str())
+          .unwrap_or("");
+        if group_type != "EPalGroupType::Guild" {
+          continue;
+        }
+        let raw_data = entry.pointer("/value/RawData/value");
+        if raw_data.is_none() {
+          continue;
+        }
+        let rd = raw_data.unwrap();
+        let g_name = rd["guild_name"].as_str().unwrap_or("").to_string();
+        if let Some(players) = rd["players"].as_array() {
+          for p in players {
+            let puid = p["player_uid"].as_str().unwrap_or("").to_string();
+            let last_online = p["player_info"]["last_online_real_time"]
+              .as_i64()
+              .unwrap_or(0);
+            let pname = p["player_info"]["player_name"]
+              .as_str()
+              .unwrap_or("")
+              .to_string();
+            if !puid.is_empty() {
+              guild_info.insert(puid, (pname, last_online, g_name.clone()));
+            }
+          }
+        }
+      }
+    }
+  }
+
+  // ── 2. Extract character info from CharacterSaveParameterMap ──
+  // Maps: player_uuid → level, counts pals per owner
+  let mut player_levels: HashMap<String, u32> = HashMap::new();
+  let mut player_names_cspm: HashMap<String, String> = HashMap::new();
+  let mut pals_count: HashMap<String, usize> = HashMap::new();
+
+  if let Some(cspm) = world_data.get("CharacterSaveParameterMap") {
+    if let Some(entries) = cspm.get("value").and_then(|v| v.as_array()) {
+      for entry in entries {
+        // Key has PlayerUId and InstanceId
+        let player_uid = entry
+          .pointer("/key/PlayerUId/value")
+          .and_then(|v| v.as_str())
+          .unwrap_or("")
+          .to_string();
+
+        // Decoded RawData for the character
+        let raw_data = entry.pointer("/value/RawData");
+        if raw_data.is_none() {
+          continue;
+        }
+        let rd = raw_data.unwrap();
+        let save_param = &rd["value"]["object"]["SaveParameter"]["value"];
+
+        let is_player = save_param
+          .get("IsPlayer")
+          .and_then(|v| v.get("value"))
+          .and_then(|v| v.as_bool())
+          .unwrap_or(false);
+
+        if is_player {
+          // This is a player character
+          let level = save_param
+            .get("Level")
+            .and_then(|v| v.get("value"))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1) as u32;
+          let nick = save_param
+            .get("NickName")
+            .and_then(|v| v.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+          player_levels.insert(player_uid.clone(), level);
+          if !nick.is_empty() {
+            player_names_cspm.insert(player_uid, nick);
+          }
+        } else {
+          // This is a pal – count under owner
+          let owner = save_param
+            .get("OwnerPlayerUId")
+            .and_then(|v| v.get("value"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+          if !owner.is_empty() && owner != "00000000-0000-0000-0000-000000000000" {
+            *pals_count.entry(owner.to_string()).or_insert(0) += 1;
+          }
+        }
+      }
+    }
+  }
+
+  // ── 3. Get current game time for "last seen" calculation ──
+  let current_ticks = world_data
+    .pointer("/GameTimeSaveData/value/RealDateTimeTicks/value")
+    .and_then(|v| v.as_u64())
+    .unwrap_or(0);
+
+  // ── 4. Build player list ──
+  // Combine guild_info + cspm data
+  let mut all_uuids: Vec<String> = Vec::new();
+  for uuid in guild_info.keys() {
+    if !all_uuids.contains(uuid) {
+      all_uuids.push(uuid.clone());
+    }
+  }
+  for uuid in player_levels.keys() {
+    if !all_uuids.contains(uuid) {
+      all_uuids.push(uuid.clone());
+    }
+  }
+
+  let mut result = Vec::new();
+  for uuid in &all_uuids {
+    let filename = uuid_to_filename(uuid);
+    let (guild_name_str, last_online_str, player_name) = if let Some((name, ticks, gname)) = guild_info.get(uuid) {
+      let last_seen = format_last_seen(*ticks, current_ticks);
+      (gname.clone(), last_seen, name.clone())
+    } else {
+      ("".to_string(), "Unknown".to_string(), "".to_string())
+    };
+
+    let name = if !player_name.is_empty() {
+      player_name
+    } else if let Some(nick) = player_names_cspm.get(uuid) {
+      nick.clone()
+    } else {
+      filename.clone()
+    };
+
+    let level = player_levels.get(uuid).copied().unwrap_or(0);
+    let pals = pals_count.get(uuid).copied().unwrap_or(0);
+
+    result.push(LevelPlayerInfo {
+      uuid: uuid.clone(),
+      filename,
+      name,
+      level,
+      pals_count: pals,
+      last_online: last_online_str,
+      guild_name: guild_name_str,
+    });
+  }
+
+  Ok(result)
+}
+
+/// Format last_online ticks relative to current game ticks into human-readable text.
+fn format_last_seen(last_online_ticks: i64, current_ticks: u64) -> String {
+  if last_online_ticks <= 0 {
+    return "Unknown".to_string();
+  }
+  let diff_ticks = current_ticks as i64 - last_online_ticks;
+  if diff_ticks < 0 {
+    return "Online now".to_string();
+  }
+  // 1 tick = 100 nanoseconds = 0.0000001 seconds
+  let seconds = diff_ticks / 10_000_000;
+  if seconds < 60 {
+    return "Online now".to_string();
+  }
+  let minutes = seconds / 60;
+  if minutes < 60 {
+    return format!("{minutes} min ago");
+  }
+  let hours = minutes / 60;
+  if hours < 24 {
+    return format!("{hours}h ago");
+  }
+  let days = hours / 24;
+  format!("{days}d ago")
+}
+
+/// Modify a single player .sav file, swapping internal PlayerUId references.
+fn modify_player_sav(sav_path: &Path, old_uid: &str, new_uid: &str) -> Result<(), String> {
+  let data = fs::read(sav_path).map_err(|e| format!("read player sav: {e}"))?;
+  let (mut json, save_type) = gvas::sav_to_json(&data)?;
+
+  // Update PlayerUId
+  if let Some(puid) = json.pointer_mut("/properties/SaveData/value/PlayerUId/value") {
+    if puid.as_str() == Some(old_uid) {
+      *puid = Value::String(new_uid.to_string());
+    }
+  }
+  // Update IndividualId → PlayerUId
+  if let Some(iid) = json.pointer_mut("/properties/SaveData/value/IndividualId/value/PlayerUId/value") {
+    if iid.as_str() == Some(old_uid) {
+      *iid = Value::String(new_uid.to_string());
+    }
+  }
+
+  let sav_bytes = gvas::json_to_sav(&json, save_type)?;
+  fs::write(sav_path, &sav_bytes).map_err(|e| format!("write player sav: {e}"))?;
+  Ok(())
+}
+
 fn build_players(
-  wc: &mut WorldConfig,
   player_ids: &[String],
   host_id: &str,
+  level_info: &[LevelPlayerInfo],
 ) -> Vec<Player> {
   player_ids
     .iter()
     .map(|id| {
-      let name = wc
-        .players
-        .entry(id.clone())
-        .or_insert_with(|| id.clone())
-        .clone();
-      let original_id = wc
-        .original_names
-        .entry(id.clone())
-        .or_insert_with(|| id.clone())
-        .clone();
+      // Find matching info from Level.sav
+      let info = level_info.iter().find(|li| li.filename == *id);
+      let name = info.map(|i| i.name.clone()).unwrap_or_else(|| id.clone());
+      let level = info.map(|i| i.level).unwrap_or(0);
+      let pals_count = info.map(|i| i.pals_count).unwrap_or(0);
+      let last_online = info.map(|i| i.last_online.clone()).unwrap_or_default();
+      let guild_name = info.map(|i| i.guild_name.clone()).unwrap_or_default();
       Player {
         id: id.clone(),
         name,
-        original_id,
+        original_id: id.clone(),
         is_host: id == host_id,
+        level,
+        pals_count,
+        last_online,
+        guild_name,
       }
     })
     .collect()
 }
 
-fn swap_files(players_dir: &Path, first_id: &str, second_id: &str) -> Result<(), String> {
-  let first = players_dir.join(format!("{}.sav", normalize_id(first_id)));
-  let second = players_dir.join(format!("{}.sav", normalize_id(second_id)));
-  if !first.exists() || !second.exists() {
+/// Swap .sav files + modify Level.sav with GVAS-based UID swap.
+/// Emits granular swap-progress events when `progress` is provided.
+fn swap_players_full(
+  world_path: &Path,
+  players_dir: &Path,
+  first_id: &str,
+  second_id: &str,
+  progress: Option<(&AppHandle, f64, f64)>, // (app, base%, range%)
+) -> Result<(), String> {
+  // progress helper: emit (base + fraction * range)
+  let emit = |frac: f64, msg: &str| {
+    if let Some((app, base, range)) = &progress {
+      let _ = app.emit("swap-progress", ProgressPayload {
+        percent: base + frac * range,
+        message: msg.to_string(),
+      });
+    }
+  };
+
+  let first = normalize_id(first_id);
+  let second = normalize_id(second_id);
+
+  let first_sav = players_dir.join(format!("{first}.sav"));
+  let second_sav = players_dir.join(format!("{second}.sav"));
+  if !first_sav.exists() || !second_sav.exists() {
     return Err("Missing .sav files for swap.".to_string());
   }
+
+  let uuid_first = filename_to_uuid(&first);
+  let uuid_second = filename_to_uuid(&second);
+
+  // ── Level.sav: read ──
+  emit(0.0, "Reading Level.sav…");
+  let level_sav = world_path.join("Level.sav");
+  if !level_sav.exists() {
+    return Err("Level.sav not found.".into());
+  }
+  let data = fs::read(&level_sav).map_err(|e| format!("Cannot read Level.sav: {e}"))?;
+
+  // ── Level.sav: parse ──
+  emit(0.05, "Parsing Level.sav…");
+  let (mut json, save_type) = gvas::sav_to_json(&data)?;
+
+  // ── Level.sav: modify UIDs ──
+  emit(0.35, "Swapping UIDs…");
+  {
+    let world_data = json
+      .get_mut("properties")
+      .and_then(|p| p.get_mut("worldSaveData"))
+      .and_then(|w| w.get_mut("value"))
+      .ok_or("Cannot navigate to worldSaveData")?;
+
+    if let Some(cspm) = world_data.get_mut("CharacterSaveParameterMap") {
+      if let Some(entries) = cspm.get_mut("value").and_then(|v| v.as_array_mut()) {
+        for entry in entries.iter_mut() {
+          if let Some(key) = entry.get_mut("key") {
+            if let Some(puid) = key.pointer_mut("/PlayerUId/value") {
+              if let Some(s) = puid.as_str().map(|s| s.to_string()) {
+                if s == uuid_first {
+                  *puid = Value::String(uuid_second.to_string());
+                } else if s == uuid_second {
+                  *puid = Value::String(uuid_first.to_string());
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    if let Some(gsm) = world_data.get_mut("GroupSaveDataMap") {
+      if let Some(entries) = gsm.get_mut("value").and_then(|v| v.as_array_mut()) {
+        for entry in entries.iter_mut() {
+          let raw_data = entry.pointer_mut("/value/RawData/value");
+          if let Some(rd) = raw_data {
+            if let Some(admin) = rd.get_mut("admin_player_uid") {
+              if let Some(s) = admin.as_str().map(|s| s.to_string()) {
+                if s == uuid_first {
+                  *admin = Value::String(uuid_second.to_string());
+                } else if s == uuid_second {
+                  *admin = Value::String(uuid_first.to_string());
+                }
+              }
+            }
+            if let Some(players) = rd.get_mut("players").and_then(|p| p.as_array_mut()) {
+              for p in players.iter_mut() {
+                if let Some(puid) = p.get_mut("player_uid") {
+                  if let Some(s) = puid.as_str().map(|s| s.to_string()) {
+                    if s == uuid_first {
+                      *puid = Value::String(uuid_second.to_string());
+                    } else if s == uuid_second {
+                      *puid = Value::String(uuid_first.to_string());
+                    }
+                  }
+                }
+              }
+            }
+            if let Some(handles) = rd.get_mut("individual_character_handle_ids").and_then(|h| h.as_array_mut()) {
+              for h in handles.iter_mut() {
+                if let Some(guid) = h.get_mut("guid") {
+                  if let Some(s) = guid.as_str().map(|s| s.to_string()) {
+                    if s == uuid_first {
+                      *guid = Value::String(uuid_second.to_string());
+                    } else if s == uuid_second {
+                      *guid = Value::String(uuid_first.to_string());
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
+    gvas::deep_swap_uids(world_data, &uuid_first, &uuid_second);
+  }
+
+  // ── Level.sav: serialize ──
+  emit(0.42, "Serializing Level.sav…");
+  let sav_bytes = gvas::json_to_sav(&json, save_type)?;
+
+  // ── Level.sav: write ──
+  emit(0.72, "Writing Level.sav…");
+  fs::write(&level_sav, &sav_bytes).map_err(|e| format!("Cannot write Level.sav: {e}"))?;
+
+  // ── Modify player .sav files ──
+  emit(0.78, "Patching player saves…");
+  if let Err(e) = modify_player_sav(&first_sav, &uuid_first, &uuid_second) {
+    eprintln!("[palhost] warn: could not modify {first}.sav internals: {e}");
+  }
+  emit(0.88, "Patching player saves…");
+  if let Err(e) = modify_player_sav(&second_sav, &uuid_second, &uuid_first) {
+    eprintln!("[palhost] warn: could not modify {second}.sav internals: {e}");
+  }
+
+  // ── Rename .sav files ──
+  emit(0.96, "Renaming files…");
   let stamp = std::time::SystemTime::now()
     .duration_since(std::time::UNIX_EPOCH)
     .map_err(|err| err.to_string())?
     .as_millis();
   let temp = players_dir.join(format!("swap-{stamp}.tmp"));
-  fs::rename(&first, &temp).map_err(|err| err.to_string())?;
-  fs::rename(&second, &first).map_err(|err| err.to_string())?;
-  fs::rename(&temp, &second).map_err(|err| err.to_string())?;
+  fs::rename(&first_sav, &temp).map_err(|err| err.to_string())?;
+  fs::rename(&second_sav, &first_sav).map_err(|err| err.to_string())?;
+  fs::rename(&temp, &second_sav).map_err(|err| err.to_string())?;
+
+  emit(1.0, "Swap complete.");
   Ok(())
 }
 
-fn backup_files(players_dir: &Path, ids: &[String], snapshot: &BackupSnapshot) -> Result<PathBuf, String> {
+fn backup_files(players_dir: &Path, world_path: &Path, ids: &[String], snapshot: &BackupSnapshot) -> Result<PathBuf, String> {
   let stamp = chrono::Utc::now().format("%Y-%m-%d_%H-%M-%S").to_string();
   let backup_dir = players_dir.join("backup").join(stamp);
   fs::create_dir_all(&backup_dir).map_err(|err| err.to_string())?;
@@ -359,6 +762,12 @@ fn backup_files(players_dir: &Path, ids: &[String], snapshot: &BackupSnapshot) -
       let dest = backup_dir.join(format!("{}.sav", normalize_id(id)));
       fs::copy(&src, &dest).map_err(|err| err.to_string())?;
     }
+  }
+  // Backup Level.sav
+  let level_sav = world_path.join("Level.sav");
+  if level_sav.exists() {
+    let dest = backup_dir.join("Level.sav");
+    fs::copy(&level_sav, &dest).map_err(|err| err.to_string())?;
   }
   // Save config snapshot with names mapping
   let snapshot_json = serde_json::to_string_pretty(snapshot).map_err(|err| err.to_string())?;
@@ -426,133 +835,113 @@ fn reset_world_name(account_id: String, world_id: String) -> Result<Vec<WorldInf
 }
 
 #[tauri::command]
-fn get_players(app: AppHandle, account_id: String, world_id: String) -> Result<Vec<Player>, String> {
-  let dir = players_dir(&account_id, &world_id)?;
+async fn get_players(app: AppHandle, account_id: String, world_id: String) -> Result<Vec<Player>, String> {
+  let a = app.clone();
+  tauri::async_runtime::spawn_blocking(move || {
+    get_players_sync(&a, &account_id, &world_id)
+  })
+  .await
+  .map_err(|e| format!("Task error: {e}"))?
+}
+
+fn get_players_sync(app: &AppHandle, account_id: &str, world_id: &str) -> Result<Vec<Player>, String> {
+  let dir = players_dir(account_id, world_id)?;
+  let wpath = world_dir(account_id, world_id)?;
   let player_ids = list_player_ids(&dir);
   if player_ids.is_empty() {
     return Ok(Vec::new());
   }
-  let mut wc = load_world_config(&dir);
-  prune_world_config(&mut wc, &player_ids);
+  let wc = load_world_config(&dir);
   let host_id = resolve_host_id(&wc, &player_ids).ok_or("Host not found.")?;
-  wc.host_id = Some(host_id.clone());
-  let players = build_players(&mut wc, &player_ids, &host_id);
-  save_world_config(&dir, &wc)?;
+
+  // Read player info from Level.sav
+  let level_info = match extract_players_from_level(&wpath) {
+    Ok(info) => info,
+    Err(e) => {
+      eprintln!("[palhost] Failed to parse Level.sav: {e}");
+      Vec::new()
+    }
+  };
+
+  let players = build_players(&player_ids, &host_id, &level_info);
+
   // Remember last-used account/world
-  let mut ac = load_app_config(&app).unwrap_or_default();
-  ac.account_id = Some(account_id);
-  ac.world_id = Some(world_id);
-  let _ = save_app_config(&app, &ac);
+  let mut ac = load_app_config(app).unwrap_or_default();
+  ac.account_id = Some(account_id.to_string());
+  ac.world_id = Some(world_id.to_string());
+  let _ = save_app_config(app, &ac);
+
   Ok(players)
 }
 
 #[tauri::command]
-fn set_host_player(
+async fn set_host_player(
   app: AppHandle,
   account_id: String,
   world_id: String,
   player_id: String,
 ) -> Result<Vec<Player>, String> {
-  let dir = players_dir(&account_id, &world_id)?;
+  let a = app.clone();
+  tauri::async_runtime::spawn_blocking(move || {
+    set_host_player_sync(&a, &account_id, &world_id, &player_id)
+  })
+  .await
+  .map_err(|e| format!("Task error: {e}"))?
+}
+
+fn set_host_player_sync(
+  app: &AppHandle,
+  account_id: &str,
+  world_id: &str,
+  player_id: &str,
+) -> Result<Vec<Player>, String> {
+  let dir = players_dir(account_id, world_id)?;
+  let wpath = world_dir(account_id, world_id)?;
   let player_ids = list_player_ids(&dir);
-  let mut wc = load_world_config(&dir);
+  let wc = load_world_config(&dir);
   let host_id = resolve_host_id(&wc, &player_ids).ok_or("Host not found.")?;
-  let target_id = normalize_id(&player_id);
+  let target_id = normalize_id(player_id);
   if host_id == target_id {
-    return get_players(app, account_id, world_id);
+    return get_players_sync(app, account_id, world_id);
   }
-  swap_files(&dir, &host_id, &target_id)?;
-  // Swap display names
-  let first_name = wc.players.entry(host_id.clone()).or_insert_with(|| host_id.clone()).clone();
-  let second_name = wc.players.entry(target_id.clone()).or_insert_with(|| target_id.clone()).clone();
-  wc.players.insert(host_id.clone(), second_name);
-  wc.players.insert(target_id.clone(), first_name);
-  // Swap original identities (they follow the data)
-  let first_orig = wc.original_names.entry(host_id.clone()).or_insert_with(|| host_id.clone()).clone();
-  let second_orig = wc.original_names.entry(target_id.clone()).or_insert_with(|| target_id.clone()).clone();
-  wc.original_names.insert(host_id, second_orig);
-  wc.original_names.insert(target_id, first_orig);
-  save_world_config(&dir, &wc)?;
-  get_players(app, account_id, world_id)
+  swap_players_full(&wpath, &dir, &host_id, &target_id, Some((app, 0.0, 90.0)))?;
+  let _ = app.emit("swap-progress", ProgressPayload { percent: 95.0, message: "Reloading players…".into() });
+  get_players_sync(app, account_id, world_id)
 }
 
 #[tauri::command]
-fn swap_players(
+async fn swap_players(
   app: AppHandle,
   account_id: String,
   world_id: String,
   first_id: String,
   second_id: String,
 ) -> Result<Vec<Player>, String> {
-  let dir = players_dir(&account_id, &world_id)?;
-  let first = normalize_id(&first_id);
-  let second = normalize_id(&second_id);
-  swap_files(&dir, &first, &second)?;
-  let mut wc = load_world_config(&dir);
-  // Swap display names
-  let first_name = wc.players.entry(first.clone()).or_insert_with(|| first.clone()).clone();
-  let second_name = wc.players.entry(second.clone()).or_insert_with(|| second.clone()).clone();
-  wc.players.insert(first.clone(), second_name);
-  wc.players.insert(second.clone(), first_name);
-  // Swap original identities (they follow the data)
-  let first_orig = wc.original_names.entry(first.clone()).or_insert_with(|| first.clone()).clone();
-  let second_orig = wc.original_names.entry(second.clone()).or_insert_with(|| second.clone()).clone();
-  wc.original_names.insert(first, second_orig);
-  wc.original_names.insert(second, first_orig);
-  save_world_config(&dir, &wc)?;
-  get_players(app, account_id, world_id)
+  let a = app.clone();
+  tauri::async_runtime::spawn_blocking(move || {
+    swap_players_sync(&a, &account_id, &world_id, &first_id, &second_id)
+  })
+  .await
+  .map_err(|e| format!("Task error: {e}"))?
 }
 
-#[tauri::command]
-fn set_host_slot(
-  app: AppHandle,
-  account_id: String,
-  world_id: String,
-  host_id: String,
+fn swap_players_sync(
+  app: &AppHandle,
+  account_id: &str,
+  world_id: &str,
+  first_id: &str,
+  second_id: &str,
 ) -> Result<Vec<Player>, String> {
-  let dir = players_dir(&account_id, &world_id)?;
-  let mut wc = load_world_config(&dir);
-  wc.host_id = Some(normalize_id(&host_id));
-  save_world_config(&dir, &wc)?;
-  get_players(app, account_id, world_id)
+  let dir = players_dir(account_id, world_id)?;
+  let wpath = world_dir(account_id, world_id)?;
+  let first = normalize_id(first_id);
+  let second = normalize_id(second_id);
+  swap_players_full(&wpath, &dir, &first, &second, Some((app, 0.0, 90.0)))?;
+  let _ = app.emit("swap-progress", ProgressPayload { percent: 95.0, message: "Reloading players…".into() });
+  get_players_sync(app, account_id, world_id)
 }
 
-#[tauri::command]
-fn set_player_name(
-  app: AppHandle,
-  account_id: String,
-  world_id: String,
-  player_id: String,
-  name: String,
-) -> Result<Vec<Player>, String> {
-  let dir = players_dir(&account_id, &world_id)?;
-  let mut wc = load_world_config(&dir);
-  let normalized = normalize_id(&player_id);
-  wc.original_names
-    .entry(normalized.clone())
-    .or_insert_with(|| normalized.clone());
-  wc.players.insert(normalized, name);
-  save_world_config(&dir, &wc)?;
-  get_players(app, account_id, world_id)
-}
 
-#[tauri::command]
-fn reset_player_names(
-  app: AppHandle,
-  account_id: String,
-  world_id: String,
-) -> Result<Vec<Player>, String> {
-  let dir = players_dir(&account_id, &world_id)?;
-  let player_ids = list_player_ids(&dir);
-  let mut wc = load_world_config(&dir);
-  for id in player_ids {
-    // Restore display name to the original identity stored for this slot.
-    let orig = wc.original_names.get(&id).cloned().unwrap_or_else(|| id.clone());
-    wc.players.insert(id, orig);
-  }
-  save_world_config(&dir, &wc)?;
-  get_players(app, account_id, world_id)
-}
 
 #[tauri::command]
 fn create_backup(
@@ -562,6 +951,7 @@ fn create_backup(
   player_ids: Vec<String>,
 ) -> Result<String, String> {
   let dir = players_dir(&account_id, &world_id)?;
+  let wpath = world_dir(&account_id, &world_id)?;
   let wc = load_world_config(&dir);
   let snapshot = BackupSnapshot {
     host_id: wc.host_id.clone(),
@@ -569,7 +959,7 @@ fn create_backup(
     original_names: wc.original_names.clone(),
     display_name: wc.display_name.clone(),
   };
-  let backup_dir = backup_files(&dir, &player_ids, &snapshot)?;
+  let backup_dir = backup_files(&dir, &wpath, &player_ids, &snapshot)?;
   Ok(backup_dir.to_string_lossy().to_string())
 }
 
@@ -580,13 +970,28 @@ fn list_backups(account_id: String, world_id: String) -> Result<Vec<String>, Str
 }
 
 #[tauri::command]
-fn restore_backup(
+async fn restore_backup(
   app: AppHandle,
   account_id: String,
   world_id: String,
   backup_name: String,
 ) -> Result<Vec<Player>, String> {
-  let dir = players_dir(&account_id, &world_id)?;
+  let a = app.clone();
+  tauri::async_runtime::spawn_blocking(move || {
+    restore_backup_sync(&a, &account_id, &world_id, &backup_name)
+  })
+  .await
+  .map_err(|e| format!("Task error: {e}"))?
+}
+
+fn restore_backup_sync(
+  app: &AppHandle,
+  account_id: &str,
+  world_id: &str,
+  backup_name: &str,
+) -> Result<Vec<Player>, String> {
+  let dir = players_dir(account_id, world_id)?;
+  let wpath = world_dir(account_id, world_id)?;
   let backup_dir = dir.join("backup").join(backup_name);
   if !backup_dir.exists() {
     return Err("Backup not found.".to_string());
@@ -598,8 +1003,15 @@ fn restore_backup(
     let file_path = entry.path();
     if let Some(name) = file_path.file_name().and_then(|value| value.to_str()) {
       if name.ends_with(".sav") {
-        let dest = dir.join(name);
-        fs::copy(&file_path, dest).map_err(|err| err.to_string())?;
+        if name == "Level.sav" {
+          // Restore Level.sav to world root
+          let dest = wpath.join(name);
+          fs::copy(&file_path, dest).map_err(|err| err.to_string())?;
+        } else {
+          // Restore player .sav to Players dir
+          let dest = dir.join(name);
+          fs::copy(&file_path, dest).map_err(|err| err.to_string())?;
+        }
       }
     }
   }
@@ -618,7 +1030,7 @@ fn restore_backup(
     }
   }
 
-  get_players(app, account_id, world_id)
+  get_players_sync(app, account_id, world_id)
 }
 
 #[tauri::command]
@@ -1207,6 +1619,10 @@ pub fn run() {
         app.handle().plugin(
           tauri_plugin_log::Builder::default()
             .level(log::LevelFilter::Info)
+            .filter(|metadata| {
+              // Suppress noisy tao event-loop warnings on Windows
+              !metadata.target().starts_with("tao::")
+            })
             .build(),
         )?;
       }
@@ -1222,9 +1638,6 @@ pub fn run() {
       get_players,
       set_host_player,
       swap_players,
-      set_host_slot,
-      set_player_name,
-      reset_player_names,
       create_backup,
       list_backups,
       restore_backup,
@@ -1244,7 +1657,7 @@ pub fn run() {
       append_file_chunk_b64,
       get_temp_path,
       delete_temp_file,
-      extract_zip_to_temp
+      extract_zip_to_temp,
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");

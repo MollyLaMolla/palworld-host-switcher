@@ -16,9 +16,6 @@ import {
   listBackups,
   rescanStorage,
   setHostPlayer,
-  setHostSlot,
-  setPlayerName,
-  resetPlayerNames,
   resetWorldName,
   restoreBackup,
   setWorldName,
@@ -380,6 +377,22 @@ const IconCopy = ({ size = 14 }: { size?: number }) => (
   </svg>
 );
 
+const IconSettings = ({ size = 14 }: { size?: number }) => (
+  <svg
+    width={size}
+    height={size}
+    viewBox="0 0 24 24"
+    fill="none"
+    stroke="currentColor"
+    strokeWidth="2"
+    strokeLinecap="round"
+    strokeLinejoin="round"
+    style={s}>
+    <circle cx="12" cy="12" r="3" />
+    <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+  </svg>
+);
+
 /* ── Collapsible section ───────────────────────────────── */
 function Section({
   title,
@@ -411,10 +424,8 @@ function App() {
   const [players, setPlayers] = useState<Player[]>([]);
   const [accountId, setAccountId] = useState("");
   const [worldId, setWorldId] = useState("");
-  const [hostSlot, setHostSlotState] = useState("");
   const [backups, setBackups] = useState<string[]>([]);
   const [backupTarget, setBackupTarget] = useState("");
-  const [nameEdits, setNameEdits] = useState<Record<string, string>>({});
   const [searchText, setSearchText] = useState("");
   const [autoBackup, setAutoBackup] = useState(true);
   const [toasts, setToasts] = useState<
@@ -422,9 +433,16 @@ function App() {
   >([]);
   const [logs, setLogs] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
-  const [editingPlayerId, setEditingPlayerId] = useState<string | null>(null);
 
   /* ── P2P Transfer state ──────────────────────────────── */
+  const [savingSwaps, setSavingSwaps] = useState(false);
+  const [swapProgress, setSwapProgress] = useState(0);
+  const [swapMessage, setSwapMessage] = useState("");
+  const [swapSteps, setSwapSteps] = useState<
+    { fromName: string; toName: string; done: boolean }[]
+  >([]);
+  const swapIndexRef = useRef(0);
+  const swapTotalRef = useRef(1);
   const [p2pStatus, setP2pStatus] = useState<P2PStatus>("idle");
   const [p2pMessage, setP2pMessage] = useState("");
   const [p2pProgress, setP2pProgress] = useState(0);
@@ -447,11 +465,47 @@ function App() {
   const [editMode, setEditMode] = useState(false);
   const [dragSourceId, setDragSourceId] = useState<string | null>(null);
   const [dragOverId, setDragOverId] = useState<string | null>(null);
-  const [pendingSwaps, setPendingSwaps] = useState<
-    { fromId: string; toId: string }[]
-  >([]);
   const dragSourceRef = useRef<string | null>(null);
   const originalPlayersRef = useRef<Player[]>([]);
+
+  /**
+   * Compute the minimum swaps needed to go from originalPlayersRef → players.
+   * Uses a greedy "place each element" approach: iterate slots left-to-right,
+   * if slot i doesn't hold the desired content, find where it is and swap.
+   * The resulting swap list is in the correct order for sequential application.
+   */
+  const computeNetSwaps = useCallback((): {
+    fromId: string;
+    toId: string;
+  }[] => {
+    const orig = originalPlayersRef.current;
+    if (orig.length === 0) return [];
+
+    const slots = orig.map((p) => p.id);
+    // What originalId should each slot hold after user edits?
+    const desired = new Map(players.map((p) => [p.id, p.originalId]));
+    // Simulate applying swaps starting from original state
+    const current = new Map(orig.map((p) => [p.id, p.originalId]));
+    // Reverse lookup: originalId → which slot currently holds it
+    const posOf = new Map(orig.map((p) => [p.originalId, p.id]));
+
+    const swaps: { fromId: string; toId: string }[] = [];
+    for (const slot of slots) {
+      const want = desired.get(slot)!;
+      const have = current.get(slot)!;
+      if (have === want) continue;
+      // Find which slot currently holds the content we want
+      const otherSlot = posOf.get(want)!;
+      // Swap them
+      swaps.push({ fromId: slot, toId: otherSlot });
+      // Update tracking maps
+      current.set(slot, want);
+      current.set(otherSlot, have);
+      posOf.set(want, slot);
+      posOf.set(have, otherSlot);
+    }
+    return swaps;
+  }, [players]);
 
   /* Ref to always have current accountId in async callbacks */
   const accountIdRef = useRef(accountId);
@@ -471,6 +525,13 @@ function App() {
 
   /* ── Palworld process detection ────────────────────── */
   const [gameRunning, setGameRunning] = useState(false);
+
+  /* ── Player scanning state ─────────────────────────── */
+  const [scanning, setScanning] = useState(false);
+  const [scanError, setScanError] = useState<string | null>(null);
+
+  /* ── Settings panel ────────────────────────────────── */
+  const [settingsOpen, setSettingsOpen] = useState(false);
 
   useEffect(() => {
     let active = true;
@@ -639,28 +700,47 @@ function App() {
     }
     getWorldsWithCounts(accountId).then((items) => {
       setWorlds(items);
-      setWorldId(items[0]?.id ?? "");
+      setWorldId(""); // don't auto-select; let user choose
     });
   }, [accountId]);
 
   useEffect(() => {
     if (!accountId || !worldId) {
       setPlayers([]);
+      setBackups([]);
+      setBackupTarget("");
+      setScanError(null);
       return;
     }
-    getPlayers(accountId, worldId).then((items) => {
-      setPlayers(items);
-      setHostSlotState(items.find((player) => player.isHost)?.id ?? "");
-      const nextEdits: Record<string, string> = {};
-      items.forEach((player) => {
-        nextEdits[player.id] = player.name;
-      });
-      setNameEdits(nextEdits);
-    });
-    listBackups(accountId, worldId).then((items) => {
-      setBackups(items);
-      setBackupTarget(items[0] ?? "");
-    });
+    let cancelled = false;
+    const load = async () => {
+      setScanning(true);
+      setScanError(null);
+      try {
+        const [items, bk] = await Promise.all([
+          getPlayers(accountId, worldId),
+          listBackups(accountId, worldId),
+        ]);
+        if (cancelled) return;
+        setPlayers(items);
+        setBackups(bk);
+        setBackupTarget(bk[0] ?? "");
+        pushLog(`Loaded ${items.length} player(s) for world ${worldId}.`);
+      } catch (err) {
+        if (cancelled) return;
+        const msg = `${err}`;
+        setScanError(msg);
+        setPlayers([]);
+        pushLog(`Error loading players: ${msg}`);
+        pushToast(`Failed to load players: ${msg}`, "error");
+      } finally {
+        if (!cancelled) setScanning(false);
+      }
+    };
+    load();
+    return () => {
+      cancelled = true;
+    };
   }, [accountId, worldId]);
 
   const pushLog = (message: string) => {
@@ -699,7 +779,7 @@ function App() {
     try {
       await rescanStorage();
 
-      // Re-fetch everything from disk, exactly like app startup
+      // Re-fetch everything from disk
       const accs = await getAccounts();
       setAccounts(accs);
       const selAccount = accs[0] ?? "";
@@ -708,27 +788,10 @@ function App() {
       if (selAccount) {
         const ws = await getWorldsWithCounts(selAccount);
         setWorlds(ws);
-        const selWorld = ws[0]?.id ?? "";
-        setWorldId(selWorld);
-
-        if (selWorld) {
-          const ps = await getPlayers(selAccount, selWorld);
-          setPlayers(ps);
-          setHostSlotState(ps.find((p) => p.isHost)?.id ?? "");
-          const nextEdits: Record<string, string> = {};
-          ps.forEach((p) => {
-            nextEdits[p.id] = p.name;
-          });
-          setNameEdits(nextEdits);
-
-          const bk = await listBackups(selAccount, selWorld);
-          setBackups(bk);
-          setBackupTarget(bk[0] ?? "");
-        } else {
-          setPlayers([]);
-          setBackups([]);
-          setBackupTarget("");
-        }
+        setWorldId(""); // don't auto-select — let user choose
+        setPlayers([]);
+        setBackups([]);
+        setBackupTarget("");
       } else {
         setWorlds([]);
         setWorldId("");
@@ -742,29 +805,6 @@ function App() {
     } catch (err) {
       pushLog(`Error: ${err}`);
       pushToast(`Rescan failed: ${err}`, "error");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleSetHostSlot = async () => {
-    if (!hostSlot) {
-      return;
-    }
-    setLoading(true);
-    try {
-      const updated = await setHostSlot(accountId, worldId, hostSlot);
-      setPlayers(updated);
-      const nextEdits: Record<string, string> = {};
-      updated.forEach((player) => {
-        nextEdits[player.id] = player.name;
-      });
-      setNameEdits(nextEdits);
-      pushLog(`Host slot set to ${hostSlot}.`);
-      pushToast("Host slot updated.");
-    } catch (err) {
-      pushLog(`Error setting host slot: ${err}`);
-      pushToast(`Host slot failed: ${err}`, "error");
     } finally {
       setLoading(false);
     }
@@ -801,12 +841,6 @@ function App() {
     try {
       const updated = await restoreBackup(accountId, worldId, backupTarget);
       setPlayers(updated);
-      setHostSlotState(updated.find((player) => player.isHost)?.id ?? "");
-      const nextEdits: Record<string, string> = {};
-      updated.forEach((player) => {
-        nextEdits[player.id] = player.name;
-      });
-      setNameEdits(nextEdits);
       // Refresh worlds list (display_name may have changed)
       const refreshedWorlds = await getWorldsWithCounts(accountId);
       setWorlds(refreshedWorlds);
@@ -818,10 +852,6 @@ function App() {
     } finally {
       setLoading(false);
     }
-  };
-
-  const handleNameChange = (id: string, value: string) => {
-    setNameEdits((prev) => ({ ...prev, [id]: value }));
   };
 
   const handleDeleteBackup = async (name: string) => {
@@ -857,51 +887,6 @@ function App() {
     } catch (err) {
       pushLog(`Error deleting backups: ${err}`);
       pushToast(`Delete failed: ${err}`, "error");
-    } finally {
-      setLoading(false);
-    }
-  };
-
-  const handleSaveName = async (id: string) => {
-    const name = nameEdits[id] ?? "";
-    try {
-      const updated = await setPlayerName(accountId, worldId, id, name);
-      setPlayers(updated);
-      const nextEdits: Record<string, string> = {};
-      updated.forEach((player) => {
-        nextEdits[player.id] = player.name;
-      });
-      setNameEdits(nextEdits);
-      setEditingPlayerId(null);
-      pushLog(`Name saved for ${id}.`);
-      pushToast("Name saved.");
-    } catch (err) {
-      pushLog(`Error saving name: ${err}`);
-      pushToast(`Save failed: ${err}`, "error");
-    }
-  };
-
-  const handleResetNames = async () => {
-    const ok = await showConfirm(
-      "Reset all player names to their original IDs?",
-    );
-    if (!ok) {
-      return;
-    }
-    setLoading(true);
-    try {
-      const updated = await resetPlayerNames(accountId, worldId);
-      setPlayers(updated);
-      const nextEdits: Record<string, string> = {};
-      updated.forEach((player) => {
-        nextEdits[player.id] = player.name;
-      });
-      setNameEdits(nextEdits);
-      pushLog("Player names reset.");
-      pushToast("Player names reset.");
-    } catch (err) {
-      pushLog(`Error resetting names: ${err}`);
-      pushToast(`Reset failed: ${err}`, "error");
     } finally {
       setLoading(false);
     }
@@ -1014,10 +999,6 @@ function App() {
           }
           return next;
         });
-        setPendingSwaps((prev) => [
-          ...prev,
-          { fromId: sourceId, toId: targetId },
-        ]);
         pushToast(`Swapped: ${source.name} ↔ ${target.name}`, "info");
       }
     }
@@ -1028,19 +1009,41 @@ function App() {
   };
 
   const handleApplySwaps = async () => {
-    if (pendingSwaps.length === 0) return;
+    const netSwaps = computeNetSwaps();
+    if (netSwaps.length === 0) {
+      pushToast("No net changes to apply.", "info");
+      originalPlayersRef.current = [];
+      setEditMode(false);
+      return;
+    }
     const ok = await showConfirm(
-      `Confirm ${pendingSwaps.length} swap${pendingSwaps.length > 1 ? "s" : ""}?`,
+      `Confirm ${netSwaps.length} swap${netSwaps.length > 1 ? "s" : ""}?`,
     );
     if (!ok) return;
     setLoading(true);
+    setSavingSwaps(true);
+    setSwapProgress(0);
+    setSwapMessage("Preparing…");
+    // Build step list for visual progress
+    const origPlayers = originalPlayersRef.current;
+    const stepList = netSwaps.map((s) => {
+      const fromName = origPlayers.find((p) => p.id === s.fromId)?.name ?? s.fromId;
+      const toName = origPlayers.find((p) => p.id === s.toId)?.name ?? s.toId;
+      return { fromName, toName, done: false };
+    });
+    setSwapSteps(stepList);
+    swapTotalRef.current = netSwaps.length;
     try {
       await handleAutoBackup("drag swap");
-      // Replay swaps against backend state (original order)
-      // We use a shadow copy to track evolving host status
+      // Apply only the minimum set of swaps derived from the permutation diff
       let shadow = originalPlayersRef.current.map((p) => ({ ...p }));
       let updatedPlayers = shadow;
-      for (const swap of pendingSwaps) {
+      for (let i = 0; i < netSwaps.length; i++) {
+        const swap = netSwaps[i];
+        swapIndexRef.current = i;
+        setSwapSteps((prev) =>
+          prev.map((s, j) => (j === i ? { ...s, done: false } : s)),
+        );
         const isFromHost = shadow.find((p) => p.id === swap.fromId)?.isHost;
         const isToHost = shadow.find((p) => p.id === swap.toId)?.isHost;
         if (isFromHost || isToHost) {
@@ -1054,25 +1057,23 @@ function App() {
             swap.toId,
           );
         }
-        // Update shadow so next iteration sees correct host flags
         shadow = updatedPlayers.map((p) => ({ ...p }));
+        setSwapSteps((prev) =>
+          prev.map((s, j) => (j === i ? { ...s, done: true } : s)),
+        );
         pushLog(`Swapped: ${swap.fromId} ↔ ${swap.toId}`);
       }
+      setSwapProgress(100);
+      setSwapMessage("Done!");
       setPlayers(updatedPlayers);
       originalPlayersRef.current = [];
-      setHostSlotState(updatedPlayers.find((p) => p.isHost)?.id ?? "");
-      const nextEdits: Record<string, string> = {};
-      updatedPlayers.forEach((p) => {
-        nextEdits[p.id] = p.name;
-      });
-      setNameEdits(nextEdits);
-      pushToast(`${pendingSwaps.length} swap(s) applied.`);
-      setPendingSwaps([]);
+      pushToast(`${netSwaps.length} swap(s) applied.`);
       setEditMode(false);
     } catch (err) {
       pushLog(`Swap error: ${err}`);
       pushToast(`Swap failed: ${err}`, "error");
     } finally {
+      setSavingSwaps(false);
       setLoading(false);
     }
   };
@@ -1082,7 +1083,7 @@ function App() {
     if (originalPlayersRef.current.length > 0) {
       setPlayers(originalPlayersRef.current);
     }
-    setPendingSwaps([]);
+    originalPlayersRef.current = [];
     setEditMode(false);
     pushToast("Edit mode cancelled.", "info");
   };
@@ -1145,7 +1146,21 @@ function App() {
           if (!cancelled) setImportProgress(event.payload.percent);
         },
       );
-      unsubs.push(u1, u2);
+      const u3 = await listen<{ percent: number; message: string }>(
+        "swap-progress",
+        (event) => {
+          if (!cancelled) {
+            const { percent, message } = event.payload;
+            // Map per-swap percent (0-100) to overall progress
+            const idx = swapIndexRef.current;
+            const total = swapTotalRef.current;
+            const globalPct = ((idx + percent / 100) / total) * 100;
+            setSwapProgress(globalPct);
+            setSwapMessage(message);
+          }
+        },
+      );
+      unsubs.push(u1, u2, u3);
     };
     setup();
     return () => {
@@ -1238,12 +1253,6 @@ function App() {
       try {
         const freshPlayers = await getPlayers(currentAccountId, targetName);
         setPlayers(freshPlayers);
-        setHostSlotState(freshPlayers.find((p) => p.isHost)?.id ?? "");
-        const nextEdits: Record<string, string> = {};
-        freshPlayers.forEach((p) => {
-          nextEdits[p.id] = p.name;
-        });
-        setNameEdits(nextEdits);
 
         const freshBackups = await listBackups(currentAccountId, targetName);
         setBackups(freshBackups);
@@ -1466,11 +1475,8 @@ function App() {
   const p2pHasMeteredFields =
     p2pMeteredDomain.trim().length > 0 || p2pMeteredApiKey.trim().length > 0;
 
-  const playerOptions = players.map((player) => (
-    <option key={player.id} value={player.id}>
-      {player.name} ({player.id})
-    </option>
-  ));
+  // Number of actual backend swaps needed (net diff, not history count)
+  const netSwapCount = editMode ? computeNetSwaps().length : 0;
 
   const filteredPlayers = players.filter((player) => {
     const term = searchText.trim().toLowerCase();
@@ -1503,6 +1509,45 @@ function App() {
               This overlay will disappear automatically when the game is closed.
             </p>
           </div>
+        </div>
+      )}
+
+      {/* ── Saving swaps overlay ─────────────────────────── */}
+      {savingSwaps && (
+        <div className="scanning-overlay">
+          <span className="scanning-overlay__spinner" />
+          <h3 className="scanning-overlay__title">Saving swaps…</h3>
+          <p className="scanning-overlay__desc">
+            {swapMessage || "Modifying save files. Do not close the app."}
+          </p>
+          <span className="scanning-overlay__pct">{Math.round(swapProgress)}%</span>
+          {swapSteps.length > 0 && (
+            <ul className="swap-steps">
+              {swapSteps.map((step, i) => (
+                <li
+                  key={i}
+                  className={`swap-step${step.done ? " swap-step--done" : i === swapIndexRef.current && savingSwaps ? " swap-step--active" : ""}`}>
+                  <span className="swap-step__icon">
+                    {step.done ? "✓" : i === swapIndexRef.current ? "⟳" : "•"}
+                  </span>
+                  <span className="swap-step__names">{step.fromName}</span>
+                  <span className="swap-step__arrow">↔</span>
+                  <span className="swap-step__names">{step.toName}</span>
+                </li>
+              ))}
+            </ul>
+          )}
+        </div>
+      )}
+
+      {/* ── Scanning overlay ─────────────────────────────── */}
+      {scanning && (
+        <div className="scanning-overlay">
+          <span className="scanning-overlay__spinner" />
+          <h3 className="scanning-overlay__title">Scanning world data…</h3>
+          <p className="scanning-overlay__desc">
+            Reading Level.sav and extracting player info.
+          </p>
         </div>
       )}
 
@@ -1539,6 +1584,12 @@ function App() {
             title="Toggle console">
             <IconTerminal /> Console
           </button>
+          <button
+            className={`btn-ghost btn-sm${settingsOpen ? " active" : ""}`}
+            onClick={() => setSettingsOpen(true)}
+            title="Settings">
+            <IconSettings />
+          </button>
         </div>
       </header>
 
@@ -1566,6 +1617,7 @@ function App() {
                 <select
                   value={worldId}
                   onChange={(event) => setWorldId(event.target.value)}>
+                  <option value="">Select a world…</option>
                   {worlds.map((world) => (
                     <option key={world.id} value={world.id}>
                       {world.displayName
@@ -1582,21 +1634,6 @@ function App() {
                   Host: {players.find((p) => p.isHost)?.name ?? "—"}
                 </span>
               </div>
-            </Section>
-
-            <Section title="Host slot" defaultOpen={false}>
-              <select
-                value={hostSlot}
-                onChange={(event) => setHostSlotState(event.target.value)}>
-                <option value="">Select slot…</option>
-                {playerOptions}
-              </select>
-              <button
-                className="btn-secondary btn-full btn-sm"
-                onClick={handleSetHostSlot}
-                disabled={!hostSlot || !players.length || loading}>
-                Apply
-              </button>
             </Section>
 
             <Section title="Restore backup" defaultOpen={false}>
@@ -2022,253 +2059,310 @@ function App() {
         {/* ── Main content: Players ─────────────────────── */}
         <div className="content-wrapper">
           <main className="content">
-            {/* ── World name header ─────────────────────── */}
-            {worldId && (
-              <div className="world-name-header">
-                {editingWorldName ? (
-                  <div className="world-name-header__edit">
-                    <input
-                      className="world-name-header__input"
-                      value={worldNameDraft}
-                      onChange={(e) => setWorldNameDraft(e.target.value)}
-                      placeholder="Enter display name…"
-                      autoFocus
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") handleSaveWorldName();
-                        if (e.key === "Escape") setEditingWorldName(false);
-                      }}
-                    />
-                    <button
-                      className="btn-primary btn-sm"
-                      onClick={handleSaveWorldName}
-                      disabled={loading}>
-                      <IconCheck size={12} /> Save
-                    </button>
-                    <button
-                      className="btn-ghost btn-sm"
-                      onClick={() => setEditingWorldName(false)}>
-                      <IconX size={12} />
-                    </button>
+            {/* ── Homepage when no world selected ──────── */}
+            {!worldId && !scanning && (
+              <div className="homepage">
+                <div className="homepage__card">
+                  <div className="homepage__icon">
+                    <IconGamepad size={48} />
                   </div>
-                ) : (
-                  <div className="world-name-header__display">
-                    <h2 className="world-name-header__title">
-                      {currentWorld?.displayName ?? worldId}
-                    </h2>
-                    {currentWorld?.displayName && (
-                      <span className="world-name-header__id">{worldId}</span>
-                    )}
-                    <button
-                      className="btn-ghost btn-sm"
-                      onClick={handleStartWorldRename}
-                      title="Rename world"
-                      disabled={loading}>
-                      <IconPencil size={12} />
-                    </button>
-                    {currentWorld?.displayName && (
-                      <button
-                        className="btn-ghost btn-sm"
-                        onClick={handleResetWorldName}
-                        title="Reset to folder name"
-                        disabled={loading}>
-                        <IconRefresh size={12} />
-                      </button>
-                    )}
+                  <h2 className="homepage__title">
+                    Welcome to Palworld Host Switcher
+                  </h2>
+                  <p className="homepage__desc">
+                    Swap host ownership between players without losing progress.
+                    Select a world from the sidebar to get started.
+                  </p>
+                  <div className="homepage__steps">
+                    <div className="homepage__step">
+                      <span className="homepage__step-num">1</span>
+                      <div>
+                        <strong>Select a world</strong>
+                        <p>Pick a world from the sidebar dropdown.</p>
+                      </div>
+                    </div>
+                    <div className="homepage__step">
+                      <span className="homepage__step-num">2</span>
+                      <div>
+                        <strong>Review players</strong>
+                        <p>
+                          The app scans Level.sav to show all players with
+                          levels, pals, and guilds.
+                        </p>
+                      </div>
+                    </div>
+                    <div className="homepage__step">
+                      <span className="homepage__step-num">3</span>
+                      <div>
+                        <strong>Swap or set host</strong>
+                        <p>
+                          Drag &amp; drop players to swap slots, or pick a new
+                          host from the sidebar.
+                        </p>
+                      </div>
+                    </div>
                   </div>
-                )}
+                  <p className="homepage__hint">
+                    <IconInfo size={12} /> A backup is automatically created
+                    before every swap.
+                  </p>
+                </div>
               </div>
             )}
 
-            <div className="players-toolbar">
-              <input
-                className="search players-toolbar__search"
-                placeholder="Search by name or ID…"
-                value={searchText}
-                onChange={(event) => setSearchText(event.target.value)}
-              />
-              <span className="players-toolbar__count">
-                {filteredPlayers.length}/{players.length}
-              </span>
-              {editMode && pendingSwaps.length > 0 && (
-                <span className="players-toolbar__pending">
-                  <IconSwap size={12} /> {pendingSwaps.length} swap
-                  {pendingSwaps.length > 1 ? "s" : ""}
-                </span>
-              )}
-              {!editMode ? (
+            {/* ── Scan error ──────────────────────────────── */}
+            {!scanning && scanError && worldId && (
+              <div className="scan-error">
+                <IconAlert size={20} />
+                <h3>Failed to load player data</h3>
+                <p>{scanError}</p>
                 <button
-                  className="btn-ghost btn-sm"
+                  className="btn-secondary btn-sm"
                   onClick={() => {
-                    originalPlayersRef.current = [...players];
-                    setEditMode(true);
-                    pushToast("Edit mode: drag players to swap them.", "info");
-                  }}
-                  disabled={players.length < 2 || loading}>
-                  <IconDrag /> Edit
+                    // Force re-scan by toggling worldId
+                    const wid = worldId;
+                    setWorldId("");
+                    setTimeout(() => setWorldId(wid), 50);
+                  }}>
+                  <IconRefresh size={12} /> Retry
                 </button>
-              ) : (
-                <>
-                  <button
-                    className="btn-primary btn-sm"
-                    onClick={handleApplySwaps}
-                    disabled={pendingSwaps.length === 0 || loading}>
-                    <IconCheck size={12} /> Apply ({pendingSwaps.length})
-                  </button>
-                  <button
-                    className="btn-ghost btn-sm"
-                    onClick={handleCancelEditMode}>
-                    <IconX size={12} /> Cancel
-                  </button>
-                </>
-              )}
-              <button
-                className="btn-ghost btn-sm"
-                onClick={handleResetNames}
-                disabled={!players.length || loading || editMode}>
-                Reset Names
-              </button>
-            </div>
+              </div>
+            )}
 
-            <div className="player-list-wrapper">
-              <ul className="player-list">
-                {filteredPlayers.map((player, idx) => {
-                  // Check if this slot's content differs from original
-                  const orig = originalPlayersRef.current[idx];
-                  const hasMoved =
-                    editMode &&
-                    orig &&
-                    (orig.name !== player.name ||
-                      orig.originalId !== player.originalId);
-                  return (
-                    <li
-                      key={player.id}
-                      ref={(el) => registerCardRef(player.id, el)}
-                      className={[
-                        "player-card",
-                        player.isHost && "is-host",
-                        editMode && "edit-mode",
-                        dragOverId === player.id && "drag-over",
-                        hasMoved && "swapped",
-                      ]
-                        .filter(Boolean)
-                        .join(" ")}
-                      onPointerMove={onSwapPointerMove}
-                      onPointerUp={onSwapPointerUp}>
-                      {/* Fixed slot header: avatar + ID + badge */}
-                      <div className="slot-header">
-                        <div className="player-avatar">
-                          {player.isHost ? <IconCrown /> : <IconUser />}
-                        </div>
-                        <div className="slot-id">
-                          <span className="slot-id__label">Slot</span>
-                          <span className="slot-id__value truncate">
-                            {player.id}
-                          </span>
-                        </div>
-                        <div className="player-meta">
-                          {player.isHost ? (
-                            <span className="badge badge--host">Host</span>
-                          ) : editMode ? (
-                            <span className="badge badge--player">
-                              <IconSwap size={10} /> Drop
-                            </span>
-                          ) : (
-                            <span className="badge badge--player">Player</span>
-                          )}
-                        </div>
-                      </div>
-                      {/* Pointer-based draggable player content */}
-                      <div
-                        className={[
-                          "player-content",
-                          editMode && "player-content--draggable",
-                          dragSourceId === player.id &&
-                            "player-content--dragging",
-                        ]
-                          .filter(Boolean)
-                          .join(" ")}
-                        onPointerDown={(e) => onSwapPointerDown(e, player.id)}
-                        style={editMode ? { touchAction: "none" } : undefined}>
-                        {editMode && (
-                          <div className="player-drag-handle">
-                            <IconDrag />
-                          </div>
-                        )}
-                        <div className="player-info">
-                          <p className="player-name">
-                            <span className="truncate">{player.name}</span>
-                            {player.name !== player.originalId && (
-                              <span className="player-orig truncate">
-                                {" "}
-                                ({player.originalId})
-                              </span>
-                            )}
-                            {!editMode && (
-                              <button
-                                className="btn-ghost btn-sm player-edit-toggle"
-                                onClick={() =>
-                                  setEditingPlayerId(
-                                    editingPlayerId === player.id
-                                      ? null
-                                      : player.id,
-                                  )
-                                }
-                                title="Rename">
-                                <IconPencil />
-                              </button>
-                            )}
-                          </p>
-                          {!editMode && editingPlayerId === player.id && (
-                            <div className="player-edit">
-                              <input
-                                value={nameEdits[player.id] ?? ""}
-                                onChange={(event) =>
-                                  handleNameChange(
-                                    player.id,
-                                    event.target.value,
-                                  )
-                                }
-                                placeholder="Rename…"
-                                autoFocus
-                                onKeyDown={(event) => {
-                                  if (event.key === "Enter") {
-                                    handleSaveName(player.id);
-                                  }
-                                  if (event.key === "Escape") {
-                                    setEditingPlayerId(null);
-                                  }
-                                }}
-                              />
-                              <button
-                                className="btn-secondary btn-sm"
-                                onClick={() => handleSaveName(player.id)}
-                                disabled={
-                                  (nameEdits[player.id] ?? "").trim() ===
-                                  player.name
-                                }>
-                                Save
-                              </button>
+            {/* ── World name header ─────────────────────── */}
+            {worldId && !scanning && !scanError && (
+              <>
+                <div className="world-name-header">
+                  {editingWorldName ? (
+                    <div className="world-name-header__edit">
+                      <input
+                        className="world-name-header__input"
+                        value={worldNameDraft}
+                        onChange={(e) => setWorldNameDraft(e.target.value)}
+                        placeholder="Enter display name…"
+                        autoFocus
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") handleSaveWorldName();
+                          if (e.key === "Escape") setEditingWorldName(false);
+                        }}
+                      />
+                      <button
+                        className="btn-primary btn-sm"
+                        onClick={handleSaveWorldName}
+                        disabled={loading}>
+                        <IconCheck size={12} /> Save
+                      </button>
+                      <button
+                        className="btn-ghost btn-sm"
+                        onClick={() => setEditingWorldName(false)}>
+                        <IconX size={12} />
+                      </button>
+                    </div>
+                  ) : (
+                    <div className="world-name-header__display">
+                      <h2 className="world-name-header__title">
+                        {currentWorld?.displayName ?? worldId}
+                      </h2>
+                      {currentWorld?.displayName && (
+                        <span className="world-name-header__id">{worldId}</span>
+                      )}
+                      <button
+                        className="btn-ghost btn-sm"
+                        onClick={handleStartWorldRename}
+                        title="Rename world"
+                        disabled={loading}>
+                        <IconPencil size={12} />
+                      </button>
+                      {currentWorld?.displayName && (
+                        <button
+                          className="btn-ghost btn-sm"
+                          onClick={handleResetWorldName}
+                          title="Reset to folder name"
+                          disabled={loading}>
+                          <IconRefresh size={12} />
+                        </button>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                <div className="players-toolbar">
+                  <input
+                    className="search players-toolbar__search"
+                    placeholder="Search by name or ID…"
+                    value={searchText}
+                    onChange={(event) => setSearchText(event.target.value)}
+                  />
+                  <span className="players-toolbar__count">
+                    {filteredPlayers.length}/{players.length}
+                  </span>
+                  {editMode && netSwapCount > 0 && (
+                    <span className="players-toolbar__pending">
+                      <IconSwap size={12} /> {netSwapCount} swap
+                      {netSwapCount > 1 ? "s" : ""}
+                    </span>
+                  )}
+                  {!editMode ? (
+                    <button
+                      className="btn-ghost btn-sm"
+                      onClick={() => {
+                        originalPlayersRef.current = [...players];
+                        setEditMode(true);
+                        pushToast(
+                          "Edit mode: drag players to swap them.",
+                          "info",
+                        );
+                      }}
+                      disabled={players.length < 2 || loading}>
+                      <IconDrag /> Edit
+                    </button>
+                  ) : (
+                    <>
+                      <button
+                        className="btn-primary btn-sm"
+                        onClick={handleApplySwaps}
+                        disabled={netSwapCount === 0 || loading}>
+                        <IconCheck size={12} /> Apply ({netSwapCount})
+                      </button>
+                      <button
+                        className="btn-ghost btn-sm"
+                        onClick={handleCancelEditMode}>
+                        <IconX size={12} /> Cancel
+                      </button>
+                    </>
+                  )}
+                </div>
+
+                <div className="player-list-wrapper">
+                  <ul className="player-list">
+                    {filteredPlayers.map((player, idx) => {
+                      // Check if this slot's content differs from original
+                      const orig = originalPlayersRef.current[idx];
+                      const hasMoved =
+                        editMode &&
+                        orig &&
+                        (orig.name !== player.name ||
+                          orig.originalId !== player.originalId);
+                      return (
+                        <li
+                          key={player.id}
+                          ref={(el) => registerCardRef(player.id, el)}
+                          className={[
+                            "player-card",
+                            player.isHost && "is-host",
+                            editMode && "edit-mode",
+                            dragOverId === player.id && "drag-over",
+                            hasMoved && "swapped",
+                          ]
+                            .filter(Boolean)
+                            .join(" ")}
+                          onPointerMove={onSwapPointerMove}
+                          onPointerUp={onSwapPointerUp}>
+                          {/* Fixed slot header: avatar + ID + badge */}
+                          <div className="slot-header">
+                            <div className="player-avatar">
+                              {player.isHost ? <IconCrown /> : <IconUser />}
                             </div>
-                          )}
-                        </div>
-                      </div>
-                    </li>
-                  );
-                })}
-                {filteredPlayers.length === 0 && players.length > 0 && (
-                  <li className="player-card">
-                    <p className="empty-msg">No players match your search.</p>
-                  </li>
-                )}
-                {players.length === 0 && (
-                  <li className="player-card">
-                    <p className="empty-msg">
-                      Select an account and world to load players.
-                    </p>
-                  </li>
-                )}
-              </ul>
-            </div>
+                            <div className="slot-id">
+                              <span className="slot-id__label">Slot</span>
+                              <span className="slot-id__value truncate">
+                                {player.id}
+                              </span>
+                            </div>
+                            <div className="player-meta">
+                              {player.isHost ? (
+                                <span className="badge badge--host">Host</span>
+                              ) : editMode ? (
+                                <span className="badge badge--player">
+                                  <IconSwap size={10} /> Drop
+                                </span>
+                              ) : (
+                                <span className="badge badge--player">
+                                  Player
+                                </span>
+                              )}
+                            </div>
+                          </div>
+                          {/* Pointer-based draggable player content */}
+                          <div
+                            className={[
+                              "player-content",
+                              editMode && "player-content--draggable",
+                              dragSourceId === player.id &&
+                                "player-content--dragging",
+                            ]
+                              .filter(Boolean)
+                              .join(" ")}
+                            onPointerDown={(e) =>
+                              onSwapPointerDown(e, player.id)
+                            }
+                            style={
+                              editMode ? { touchAction: "none" } : undefined
+                            }>
+                            {editMode && (
+                              <div className="player-drag-handle">
+                                <IconDrag />
+                              </div>
+                            )}
+                            <div className="player-info">
+                              <p className="player-name">
+                                <span className="truncate">{player.name}</span>
+                              </p>
+                              {!editMode && (
+                                <div className="player-details">
+                                  {player.level > 0 && (
+                                    <span
+                                      className="player-detail"
+                                      title="Level">
+                                      Lv.{player.level}
+                                    </span>
+                                  )}
+                                  {player.palsCount > 0 && (
+                                    <span
+                                      className="player-detail"
+                                      title="Pals">
+                                      🐾 {player.palsCount}
+                                    </span>
+                                  )}
+                                  {player.guildName && (
+                                    <span
+                                      className="player-detail"
+                                      title="Guild">
+                                      ⚔ {player.guildName}
+                                    </span>
+                                  )}
+                                  {player.lastOnline && (
+                                    <span
+                                      className="player-detail"
+                                      title="Last seen">
+                                      🕐 {player.lastOnline}
+                                    </span>
+                                  )}
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        </li>
+                      );
+                    })}
+                    {filteredPlayers.length === 0 && players.length > 0 && (
+                      <li className="player-card">
+                        <p className="empty-msg">
+                          No players match your search.
+                        </p>
+                      </li>
+                    )}
+                    {players.length === 0 && (
+                      <li className="player-card">
+                        <p className="empty-msg">
+                          No players found in this world.
+                        </p>
+                      </li>
+                    )}
+                  </ul>
+                </div>
+              </>
+            )}
           </main>
 
           {/* ── Console panel ─────────────────────────────── */}
@@ -2318,6 +2412,41 @@ function App() {
           <span className="status-bar__item truncate">Last: {logs[0]}</span>
         )}
       </div>
+
+      {/* ── Settings Modal ──────────────────────────────── */}
+      {settingsOpen && (
+        <div className="modal-overlay" onClick={() => setSettingsOpen(false)}>
+          <div className="settings-modal" onClick={(e) => e.stopPropagation()}>
+            <div className="settings-modal__header">
+              <h2>
+                <IconSettings size={18} /> Settings
+              </h2>
+              <button
+                className="btn-ghost btn-sm"
+                onClick={() => setSettingsOpen(false)}>
+                <IconX size={14} />
+              </button>
+            </div>
+
+            <div className="settings-modal__body">
+              {/* ── Oodle Decompression ──── */}
+              <div className="settings-section">
+                <h3 className="settings-section__title">Oodle Decompression</h3>
+                <p className="settings-section__desc">
+                  Newer Palworld saves use Oodle compression (PLM format). This
+                  app includes a built-in open-source decompressor — no external
+                  DLL is required.
+                </p>
+                <div className="settings-oodle-status">
+                  <div className="settings-oodle-badge settings-oodle-badge--ok">
+                    <IconCheck size={12} /> Built-in
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* ── Confirm Modal ─────────────────────────────────── */}
       {confirmModal && (
