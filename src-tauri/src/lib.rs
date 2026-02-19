@@ -551,6 +551,21 @@ fn format_last_seen(last_online_ticks: i64, current_ticks: u64) -> String {
 }
 
 /// Modify a single player .sav file, swapping internal PlayerUId references.
+/// Read the InstanceId from a player .sav file (needed for InstanceId-based matching).
+fn read_player_instance_id(sav_path: &Path) -> Result<String, String> {
+  let data = fs::read(sav_path).map_err(|e| format!("read player sav: {e}"))?;
+  let (json, _) = gvas::sav_to_json(&data)?;
+  let inst = json
+    .pointer("/properties/SaveData/value/IndividualId/value/InstanceId/value")
+    .and_then(|v| v.as_str())
+    .unwrap_or("")
+    .to_string();
+  if inst.is_empty() {
+    return Err(format!("No InstanceId found in {:?}", sav_path));
+  }
+  Ok(inst)
+}
+
 fn modify_player_sav(sav_path: &Path, old_uid: &str, new_uid: &str) -> Result<(), String> {
   let data = fs::read(sav_path).map_err(|e| format!("read player sav: {e}"))?;
   let (mut json, save_type) = gvas::sav_to_json(&data)?;
@@ -603,6 +618,17 @@ fn build_players(
 }
 
 /// Swap .sav files + modify Level.sav with GVAS-based UID swap.
+/// Follows PalworldSaveTools fix_host_save logic:
+///   1. Read InstanceIds from both player .sav files
+///   2. Patch PlayerUId inside both player .sav files
+///   3. In Level.sav CharacterSaveParameterMap: swap PlayerUId only for the
+///      two entries matching by InstanceId (not all entries!)
+///   4. In Level.sav GroupSaveDataMap: swap admin, player_uid, and
+///      individual_character_handle_ids.guid matched by instance_id
+///   5. Deep-swap OwnerPlayerUId/build_player_uid/etc across all Level.sav
+///   6. Serialize Level.sav and write all files
+///   7. Rename .sav files (swap filenames)
+///
 /// Emits granular swap-progress events when `progress` is provided.
 fn swap_players_full(
   world_path: &Path,
@@ -633,20 +659,34 @@ fn swap_players_full(
   let uuid_first = filename_to_uuid(&first);
   let uuid_second = filename_to_uuid(&second);
 
-  // ── Level.sav: read ──
-  emit(0.0, "Reading Level.sav…");
+  // ── 0. Read InstanceIds from player .sav files (needed for CSPM / guild matching) ──
+  emit(0.0, "Reading player saves…");
+  let inst_first = read_player_instance_id(&first_sav)?;
+  let inst_second = read_player_instance_id(&second_sav)?;
+
+  // ── 1. Modify player .sav files (patch PlayerUId + IndividualId.PlayerUId) ──
+  emit(0.05, "Patching player saves…");
+  if let Err(e) = modify_player_sav(&first_sav, &uuid_first, &uuid_second) {
+    eprintln!("[palhost] warn: could not modify {first}.sav internals: {e}");
+  }
+  if let Err(e) = modify_player_sav(&second_sav, &uuid_second, &uuid_first) {
+    eprintln!("[palhost] warn: could not modify {second}.sav internals: {e}");
+  }
+
+  // ── 2. Level.sav: read ──
+  emit(0.10, "Reading Level.sav…");
   let level_sav = world_path.join("Level.sav");
   if !level_sav.exists() {
     return Err("Level.sav not found.".into());
   }
   let data = fs::read(&level_sav).map_err(|e| format!("Cannot read Level.sav: {e}"))?;
 
-  // ── Level.sav: parse ──
-  emit(0.05, "Parsing Level.sav…");
+  // ── 3. Level.sav: parse ──
+  emit(0.15, "Parsing Level.sav…");
   let (mut json, save_type) = gvas::sav_to_json(&data)?;
 
-  // ── Level.sav: modify UIDs ──
-  emit(0.35, "Swapping UIDs…");
+  // ── 4. Level.sav: modify UIDs ──
+  emit(0.40, "Swapping UIDs in Level.sav…");
   {
     let world_data = json
       .get_mut("properties")
@@ -654,17 +694,24 @@ fn swap_players_full(
       .and_then(|w| w.get_mut("value"))
       .ok_or("Cannot navigate to worldSaveData")?;
 
+    // 4a. CharacterSaveParameterMap: swap PlayerUId ONLY for the two entries
+    //     that match by InstanceId (the player's own character entry).
+    //     All other entries (pals, other players) are left untouched.
     if let Some(cspm) = world_data.get_mut("CharacterSaveParameterMap") {
       if let Some(entries) = cspm.get_mut("value").and_then(|v| v.as_array_mut()) {
         for entry in entries.iter_mut() {
           if let Some(key) = entry.get_mut("key") {
-            if let Some(puid) = key.pointer_mut("/PlayerUId/value") {
-              if let Some(s) = puid.as_str().map(|s| s.to_string()) {
-                if s == uuid_first {
-                  *puid = Value::String(uuid_second.to_string());
-                } else if s == uuid_second {
-                  *puid = Value::String(uuid_first.to_string());
-                }
+            let entry_inst = key
+              .pointer("/InstanceId/value")
+              .and_then(|v| v.as_str())
+              .unwrap_or("");
+            if entry_inst == inst_first {
+              if let Some(puid) = key.pointer_mut("/PlayerUId/value") {
+                *puid = Value::String(uuid_second.to_string());
+              }
+            } else if entry_inst == inst_second {
+              if let Some(puid) = key.pointer_mut("/PlayerUId/value") {
+                *puid = Value::String(uuid_first.to_string());
               }
             }
           }
@@ -672,11 +719,23 @@ fn swap_players_full(
       }
     }
 
+    // 4b. GroupSaveDataMap: swap admin_player_uid, player_uid in member list,
+    //     and individual_character_handle_ids.guid matched by instance_id.
     if let Some(gsm) = world_data.get_mut("GroupSaveDataMap") {
       if let Some(entries) = gsm.get_mut("value").and_then(|v| v.as_array_mut()) {
         for entry in entries.iter_mut() {
+          // Only process guilds
+          let is_guild = entry
+            .pointer("/value/GroupType/value/value")
+            .and_then(|v| v.as_str())
+            == Some("EPalGroupType::Guild");
+          if !is_guild {
+            continue;
+          }
+
           let raw_data = entry.pointer_mut("/value/RawData/value");
           if let Some(rd) = raw_data {
+            // Swap admin_player_uid
             if let Some(admin) = rd.get_mut("admin_player_uid") {
               if let Some(s) = admin.as_str().map(|s| s.to_string()) {
                 if s == uuid_first {
@@ -686,6 +745,8 @@ fn swap_players_full(
                 }
               }
             }
+
+            // Swap player_uid in players list
             if let Some(players) = rd.get_mut("players").and_then(|p| p.as_array_mut()) {
               for p in players.iter_mut() {
                 if let Some(puid) = p.get_mut("player_uid") {
@@ -699,15 +760,20 @@ fn swap_players_full(
                 }
               }
             }
+
+            // Swap guid in individual_character_handle_ids — matched by instance_id
             if let Some(handles) = rd.get_mut("individual_character_handle_ids").and_then(|h| h.as_array_mut()) {
               for h in handles.iter_mut() {
-                if let Some(guid) = h.get_mut("guid") {
-                  if let Some(s) = guid.as_str().map(|s| s.to_string()) {
-                    if s == uuid_first {
-                      *guid = Value::String(uuid_second.to_string());
-                    } else if s == uuid_second {
-                      *guid = Value::String(uuid_first.to_string());
-                    }
+                let h_inst = h.get("instance_id")
+                  .and_then(|v| v.as_str())
+                  .unwrap_or("");
+                if h_inst == inst_first {
+                  if let Some(guid) = h.get_mut("guid") {
+                    *guid = Value::String(uuid_second.to_string());
+                  }
+                } else if h_inst == inst_second {
+                  if let Some(guid) = h.get_mut("guid") {
+                    *guid = Value::String(uuid_first.to_string());
                   }
                 }
               }
@@ -717,28 +783,21 @@ fn swap_players_full(
       }
     }
 
+    // 4c. Deep-swap ownership UIDs (OwnerPlayerUId, build_player_uid, etc.)
+    //     across the entire worldSaveData. This is the same as PalworldSaveTools'
+    //     deep_swap() function applied to the full Level.sav.
     gvas::deep_swap_uids(world_data, &uuid_first, &uuid_second);
   }
 
-  // ── Level.sav: serialize ──
-  emit(0.42, "Serializing Level.sav…");
+  // ── 5. Level.sav: serialize ──
+  emit(0.50, "Serializing Level.sav…");
   let sav_bytes = gvas::json_to_sav(&json, save_type)?;
 
-  // ── Level.sav: write ──
-  emit(0.72, "Writing Level.sav…");
+  // ── 6. Level.sav: write ──
+  emit(0.75, "Writing Level.sav…");
   fs::write(&level_sav, &sav_bytes).map_err(|e| format!("Cannot write Level.sav: {e}"))?;
 
-  // ── Modify player .sav files ──
-  emit(0.78, "Patching player saves…");
-  if let Err(e) = modify_player_sav(&first_sav, &uuid_first, &uuid_second) {
-    eprintln!("[palhost] warn: could not modify {first}.sav internals: {e}");
-  }
-  emit(0.88, "Patching player saves…");
-  if let Err(e) = modify_player_sav(&second_sav, &uuid_second, &uuid_first) {
-    eprintln!("[palhost] warn: could not modify {second}.sav internals: {e}");
-  }
-
-  // ── Rename .sav files ──
+  // ── 7. Rename .sav files (swap filenames) ──
   emit(0.96, "Renaming files…");
   let stamp = std::time::SystemTime::now()
     .duration_since(std::time::UNIX_EPOCH)
@@ -1082,29 +1141,14 @@ fn export_world_sync(app: &AppHandle, account_id: &str, world_id: &str, dest_pat
     }
   }
 
-  // ── Build a set of old backup folders to SKIP ──────────────────────
-  // Palworld stores game backups in backup/world/<timestamp> and backup/local/<timestamp>.
-  // We keep only the most recent subfolder in each category to shrink the ZIP.
-  let mut skip_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
-
-  for sub in &["world", "local"] {
-    let bdir = wdir.join("backup").join(sub);
-    if bdir.is_dir() {
-      if let Ok(rd) = fs::read_dir(&bdir) {
-        let mut folders: Vec<PathBuf> = rd
-          .filter_map(|e| e.ok())
-          .filter(|e| e.path().is_dir())
-          .map(|e| e.path())
-          .collect();
-        // Sort by folder name descending (timestamp format sorts lexicographically)
-        folders.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
-        // Skip everything except the first (most recent)
-        for old in folders.iter().skip(1) {
-          skip_dirs.insert(old.clone());
-        }
-      }
-    }
-  }
+  // ── Skip ALL backup directories for P2P export ──────────────────────
+  // Skip <worldDir>/backup/ (Palworld game backups: backup/world/ and backup/local/)
+  // and <worldDir>/Players/backup/ (PalHost swap backups).
+  // Backups are unnecessary for P2P transfer and can be 100MB+ each.
+  let skip_dirs: Vec<PathBuf> = vec![
+    wdir.join("backup"),
+    wdir.join("Players").join("backup"),
+  ];
 
   // Count total files for progress (excluding skipped backup dirs)
   let entries: Vec<_> = WalkDir::new(&wdir)
@@ -1662,4 +1706,202 @@ pub fn run() {
     ])
     .run(tauri::generate_context!())
     .expect("error while running tauri application");
+}
+
+#[cfg(test)]
+mod tests {
+  use super::*;
+  use std::path::Path;
+
+  /// Integration test: perform swap on original save files and compare with
+  /// PalworldSaveTools "correct" output.
+  ///
+  /// Swaps player 00000000000000000000000000000001 ↔ BAAB90A2000000000000000000000000.
+  #[test]
+  fn test_swap_matches_palworld_save_tools() {
+    let examples = Path::new(env!("CARGO_MANIFEST_DIR"))
+      .parent().unwrap()
+      .join("examples").join("json example");
+    let original = examples.join("original").join("E310B8F24E41312E1A141FBBAEB1645A");
+    let correct  = examples.join("correct").join("E310B8F24E41312E1A141FBBAEB1645A");
+
+    if !original.join("Level.sav").exists() {
+      eprintln!("Skipping: original Level.sav not found");
+      return;
+    }
+    if !correct.join("Level.sav").exists() {
+      eprintln!("Skipping: correct Level.sav not found");
+      return;
+    }
+
+    // Copy original to a temp directory
+    let tmp = std::env::temp_dir().join("palhost_swap_test");
+    if tmp.exists() {
+      fs::remove_dir_all(&tmp).unwrap();
+    }
+    fs::create_dir_all(tmp.join("Players")).unwrap();
+
+    // Copy Level.sav
+    fs::copy(original.join("Level.sav"), tmp.join("Level.sav")).unwrap();
+    // Copy player .sav files
+    for entry in fs::read_dir(original.join("Players")).unwrap() {
+      let entry = entry.unwrap();
+      let name = entry.file_name().to_string_lossy().to_string();
+      if name.ends_with(".sav") {
+        fs::copy(entry.path(), tmp.join("Players").join(&name)).unwrap();
+      }
+    }
+
+    let players_dir = tmp.join("Players");
+
+    // Run our swap
+    let result = swap_players_full(
+      &tmp,
+      &players_dir,
+      "00000000000000000000000000000001",
+      "BAAB90A2000000000000000000000000",
+      None,
+    );
+    assert!(result.is_ok(), "swap_players_full failed: {:?}", result.err());
+
+    // ── Compare Level.sav ──
+    let our_data = fs::read(tmp.join("Level.sav")).unwrap();
+    let (our_json, _) = gvas::sav_to_json(&our_data).expect("parse our Level.sav");
+
+    // Load correct Level.json (PST output)
+    let correct_json: Value = serde_json::from_str(
+      &fs::read_to_string(correct.join("Level.json")).expect("read correct Level.json")
+    ).expect("parse correct Level.json");
+
+    let our_wsd = &our_json["properties"]["worldSaveData"]["value"];
+    let cor_wsd = &correct_json["properties"]["worldSaveData"]["value"];
+
+    // Compare CSPM key.PlayerUId — should match for ALL entries
+    let our_cspm = our_wsd["CharacterSaveParameterMap"]["value"].as_array().unwrap();
+    let cor_cspm = cor_wsd["CharacterSaveParameterMap"]["value"].as_array().unwrap();
+    assert_eq!(our_cspm.len(), cor_cspm.len(), "CSPM entry count mismatch");
+
+    let mut cspm_key_diffs = 0;
+    let mut cspm_key_diff_details = Vec::new();
+    for (i, (ours, cors)) in our_cspm.iter().zip(cor_cspm.iter()).enumerate() {
+      let our_puid = ours.pointer("/key/PlayerUId/value").and_then(|v| v.as_str()).unwrap_or("");
+      let cor_puid = cors.pointer("/key/PlayerUId/value").and_then(|v| v.as_str()).unwrap_or("");
+      if our_puid != cor_puid {
+        cspm_key_diffs += 1;
+        if cspm_key_diff_details.len() < 10 {
+          cspm_key_diff_details.push(format!(
+            "idx {i}: ours={our_puid} expected={cor_puid}"
+          ));
+        }
+      }
+    }
+    assert_eq!(
+      cspm_key_diffs, 0,
+      "CSPM key.PlayerUId mismatches: {cspm_key_diffs}\nFirst diffs: {cspm_key_diff_details:?}"
+    );
+
+    // Compare OwnerPlayerUId across all CSPM entries
+    let mut owner_diffs = 0;
+    let mut owner_diff_details = Vec::new();
+    for (i, (ours, cors)) in our_cspm.iter().zip(cor_cspm.iter()).enumerate() {
+      let our_owner = ours.pointer("/value/RawData/value/object/SaveParameter/value/OwnerPlayerUId/value")
+        .and_then(|v| v.as_str()).unwrap_or("");
+      let cor_owner = cors.pointer("/value/RawData/value/object/SaveParameter/value/OwnerPlayerUId/value")
+        .and_then(|v| v.as_str()).unwrap_or("");
+      if our_owner != cor_owner {
+        owner_diffs += 1;
+        if owner_diff_details.len() < 10 {
+          owner_diff_details.push(format!(
+            "idx {i}: ours={our_owner} expected={cor_owner}"
+          ));
+        }
+      }
+    }
+    assert_eq!(
+      owner_diffs, 0,
+      "OwnerPlayerUId mismatches: {owner_diffs}\nFirst diffs: {owner_diff_details:?}"
+    );
+
+    // Compare GroupSaveDataMap guild info
+    let our_gsm = our_wsd["GroupSaveDataMap"]["value"].as_array().unwrap();
+    let cor_gsm = cor_wsd["GroupSaveDataMap"]["value"].as_array().unwrap();
+    for (i, (ours, cors)) in our_gsm.iter().zip(cor_gsm.iter()).enumerate() {
+      let our_rd = &ours["value"]["RawData"]["value"];
+      let cor_rd = &cors["value"]["RawData"]["value"];
+
+      let our_admin = our_rd["admin_player_uid"].as_str().unwrap_or("");
+      let cor_admin = cor_rd["admin_player_uid"].as_str().unwrap_or("");
+      assert_eq!(our_admin, cor_admin, "Guild {i} admin_player_uid mismatch");
+
+      // Compare player_uid list
+      if let (Some(our_players), Some(cor_players)) =
+        (our_rd["players"].as_array(), cor_rd["players"].as_array())
+      {
+        for (j, (op, cp)) in our_players.iter().zip(cor_players.iter()).enumerate() {
+          let our_puid = op["player_uid"].as_str().unwrap_or("");
+          let cor_puid = cp["player_uid"].as_str().unwrap_or("");
+          assert_eq!(our_puid, cor_puid, "Guild {i} player {j} uid mismatch");
+        }
+      }
+
+      // Compare individual_character_handle_ids guid
+      if let (Some(our_handles), Some(cor_handles)) = (
+        our_rd["individual_character_handle_ids"].as_array(),
+        cor_rd["individual_character_handle_ids"].as_array(),
+      ) {
+        let mut handle_diffs = 0;
+        for (oh, ch) in our_handles.iter().zip(cor_handles.iter()) {
+          if oh["guid"].as_str() != ch["guid"].as_str() {
+            handle_diffs += 1;
+          }
+        }
+        assert_eq!(handle_diffs, 0, "Guild {i}: {handle_diffs} handle guid mismatches");
+      }
+    }
+
+    // Compare player .sav files
+    let our_host_sav = tmp.join("Players").join("00000000000000000000000000000001.sav");
+    let our_baa_sav_upper = tmp.join("Players").join("BAAB90A2000000000000000000000000.sav");
+    let our_baa_sav_lower = tmp.join("Players").join("baab90a2000000000000000000000000.sav");
+    let our_baa_sav = if our_baa_sav_upper.exists() { our_baa_sav_upper } else { our_baa_sav_lower };
+
+    let our_host_data = fs::read(&our_host_sav).unwrap();
+    let (our_host_json, _) = gvas::sav_to_json(&our_host_data).expect("parse our host.sav");
+    let our_baa_data = fs::read(&our_baa_sav).unwrap();
+    let (our_baa_json, _) = gvas::sav_to_json(&our_baa_data).expect("parse our baa.sav");
+
+    // After PST-style swap:
+    // host.sav now contains baa's original data with PlayerUId changed to baa UUID
+    // baa.sav now contains host's original data with PlayerUId changed to host UUID
+    // (because: patch UIDs first, then rename files)
+    // After PST-style swap:
+    // 1. host.sav has PlayerUId patched HOST→BAA, baa.sav has PlayerUId patched BAA→HOST
+    // 2. Files are renamed (swapped): host.sav↔baa.sav
+    // Result: HOST.sav file = old baa data with PlayerUId=HOST, BAA.sav file = old host data with PlayerUId=BAA
+    let our_host_puid = our_host_json.pointer("/properties/SaveData/value/PlayerUId/value")
+      .and_then(|v| v.as_str()).unwrap_or("");
+    assert_eq!(our_host_puid, "00000000-0000-0000-0000-000000000001",
+      "host.sav PlayerUId should stay HOST UUID (baa data renamed into host slot)");
+
+    let our_baa_puid = our_baa_json.pointer("/properties/SaveData/value/PlayerUId/value")
+      .and_then(|v| v.as_str()).unwrap_or("");
+    assert_eq!(our_baa_puid, "baab90a2-0000-0000-0000-000000000000",
+      "baa.sav PlayerUId should stay BAA UUID (host data renamed into baa slot)");
+
+    // Compare InstanceIds with correct output
+    let cor_host_json: Value = serde_json::from_str(
+      &fs::read_to_string(correct.join("Players").join("00000000000000000000000000000001.json")).unwrap()
+    ).unwrap();
+
+    let our_host_inst = our_host_json.pointer("/properties/SaveData/value/IndividualId/value/InstanceId/value")
+      .and_then(|v| v.as_str()).unwrap_or("");
+    let cor_host_inst = cor_host_json.pointer("/properties/SaveData/value/IndividualId/value/InstanceId/value")
+      .and_then(|v| v.as_str()).unwrap_or("");
+    assert_eq!(our_host_inst, cor_host_inst, "host.sav InstanceId mismatch");
+
+    eprintln!("All swap comparisons passed!");
+
+    // Cleanup
+    let _ = fs::remove_dir_all(&tmp);
+  }
 }

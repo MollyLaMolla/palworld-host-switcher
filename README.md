@@ -26,7 +26,7 @@ Swap host ownership, rename players, transfer worlds between machines, share wor
 ### World Management
 
 - **World display names** — give each world a custom name shown in the UI (folder name stays unchanged)
-- **World transfer (Export)** — export an entire world as a `.zip` archive to share with others; only the most recent backup is included to keep file size small
+- **World transfer (Export)** — export an entire world as a `.zip` archive to share with others; all backup directories are stripped to minimize file size
 - **World transfer (Import)** — import a world from a folder or ZIP via file browser or drag & drop from the OS
 - **Conflict detection** — importing a world that already exists lets you choose to replace or create a copy with a new name
 - **Smart import merge** — when replacing an existing world, backups from both the existing and imported world are preserved and merged together
@@ -41,14 +41,19 @@ The application includes a **complete, zero-dependency GVAS parser** (Unreal Eng
 - **Compression** — transparent handling of PLZ (double-zlib) and PLM (Oodle) compressed saves
 - **Player extraction from Level.sav** — reads `CharacterSaveParameterMap` and `GroupSaveDataMap` to extract player name, level, pal count, guild name, last-online ticks, and ownership UIDs
 - **Deep UID swap** — bidirectional UUID swap across `CharacterSaveParameterMap`, `GroupSaveDataMap`, ownership fields, and the full JSON tree via `deep_swap_uids`
+- **InstanceId-based swap matching** — swaps only the exact 2 player entries in `CharacterSaveParameterMap` and guild `individual_character_handle_ids` by matching `InstanceId` (read from each player's `.sav`), preventing accidental modification of pal entries
 - **Player .sav patching** — `modify_player_sav` rewrites the `PlayerUId` and `IndividualId.PlayerUId` inside each player's personal save file
-- **4 unit tests** — `test_plz_roundtrip`, `test_decompress_level_sav`, `test_parse_level_sav_to_json`, `test_roundtrip_level_sav`
+- **5 tests** — `test_plz_roundtrip`, `test_decompress_level_sav`, `test_parse_level_sav_to_json`, `test_roundtrip_level_sav`, `test_swap_matches_palworld_save_tools` (integration test comparing swap output against PalworldSaveTools)
 
 ### P2P World Transfer
 
 - **Peer-to-peer sharing** — share worlds directly between two PCs over the internet using WebRTC (no server upload needed)
 - **Sender flow** — click **Share**, get a 6-character code, and share it with the receiver
 - **Receiver flow** — enter the code, choose where to save the ZIP, and the world transfers directly from the sender's PC
+- **Binary transfer** — raw binary chunks over the data channel (no base64 encoding on the wire), saving ~33% bandwidth
+- **256 KB chunks** — large chunk size reduces IPC round-trips (~4× fewer calls than 64 KB)
+- **Sequential write queue** — receiver uses a promise chain to guarantee chunks are written in order, preventing file corruption
+- **Efficient back-pressure** — uses `bufferedAmountLowThreshold` events instead of polling, with a fallback interval for compatibility
 - **Progress tracking** — real-time progress bar and status messages for both sender and receiver
 - **Auto-import** — received worlds are automatically extracted and presented for import into your game
 - **Metered.ca TURN relay** — integrated [Metered.ca](https://www.metered.ca/) TURN support for reliable connections across NAT/CGNAT/mobile networks (free tier: 50 GB/month)
@@ -116,7 +121,7 @@ palworld-host-switcher/
 │       └── p2pService.ts         # WebRTC P2P file transfer (PeerJS)
 ├── src-tauri/                    # Rust backend
 │   ├── src/
-│   │   ├── lib.rs                # Tauri commands & file logic (~1 660 lines)
+│   │   ├── lib.rs                # Tauri commands & file logic (~1 900 lines)
 │   │   ├── gvas.rs               # GVAS save parser / serializer (~2 430 lines)
 │   │   ├── oodle.rs              # Oodle DLL FFI wrapper for PLM saves
 │   │   └── main.rs               # Binary entry point
@@ -286,29 +291,32 @@ Double-click either installer to install the app. It will appear in your Start M
 
 ## 🐛 Known Issues & Resolutions
 
-| Issue                                                       | Root Cause                                                                                     | Resolution                                                                                        |
-| ----------------------------------------------------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
-| Export freezes the UI                                       | ZIP compression ran on the main thread, blocking the event loop                                | Moved to `tauri::async_runtime::spawn_blocking()` with progress events throttled to ≥ 2% changes  |
-| Drag-and-drop for file import breaks player swap drag       | Tauri's `dragDropEnabled: true` intercepts ALL drag events via OLE handler, blocking HTML5 DnD | Replaced HTML5 drag events with **pointer events** (`onPointerDown/Move/Up`) for player swaps     |
-| Drag-dropped import doesn't detect existing world conflicts | `onDragDropEvent` closure captures stale `accountId` (empty deps `[]`)                         | Added `accountIdRef` (useRef) to always read the current value in async callbacks                 |
-| Player names lost after world import                        | UI didn't refresh players/backups after import when `worldId` stayed the same                  | Explicitly re-fetch players, host slot, and backups after successful import                       |
-| Nested folder detection for imports                         | Users often zip the world inside an extra parent folder                                        | `validate_world_folder` auto-detects and resolves same-name subfolder or single-subfolder nesting |
-| Backup didn't preserve world display name                   | `BackupSnapshot` didn't include `display_name`                                                 | Added `display_name` to snapshot with `#[serde(default)]` for backward compatibility              |
-| Console window flash every 3 seconds                        | `tasklist` process detection opened visible CMD windows in production                          | Added `CREATE_NO_WINDOW` flag (0x08000000) via `.creation_flags()` on Windows                     |
-| White flash on app startup                                  | React takes a moment to mount, showing a blank white page                                      | Inline dark splash loader in `index.html` with spinner, fades out once React mounts               |
-| Missing permissions in production build                     | Tauri v2 capabilities not configured for events, webview, and dialog in production             | Added `core:event`, `core:webview`, and `dialog` permissions to `capabilities/default.json`       |
-| Exported ZIP too large                                      | All backup history included in export                                                          | Only the most recent backup subfolder is included; older ones are skipped                         |
-| Rescan doesn't detect deleted worlds                        | Rescan only refreshed accounts, didn't cascade re-fetch worlds/players/backups                 | Rescan now fully re-loads accounts → worlds → players → backups from disk                         |
-| P2P transfer times out between different networks           | Only STUN servers configured; STUN fails with symmetric NAT / CGNAT / mobile networks          | Integrated Metered.ca TURN relay with automatic credential fetching and 10-min caching            |
-| P2P fails silently with no relay candidates                 | Free Open Relay Project servers had invalid/expired credentials                                | Replaced with Metered.ca API; each user configures their own account; Test TURN button to verify  |
-| `json_to_sav` produces corrupted files                      | Size field written included the header bytes, causing the game to reject the file              | Fixed `write_property_inner` to return only the data-only size; header written by the caller      |
-| Host detection wrong after swaps                            | Config-based host ID drifted when `.sav` files were renamed                                    | Host is now always the player whose filename is slot `000…001`; no config needed                  |
-| UI freezes during scanning / swapping                       | Heavy GVAS parsing ran on the Tauri main thread                                                | All heavy commands (`get_players`, `swap_players`, `set_host_player`, `restore_backup`) use `spawn_blocking` |
-| Unnecessary swaps when reordering many players              | Each adjacent drag was counted as a separate swap                                              | Net-diff algorithm computes the minimum permutation difference using greedy cycle decomposition   |
-| TAO window-manager warnings flooding console                | `tao` crate emitting debug messages about unhandled WM events                                  | Added `tauri_plugin_log` filter: `.filter(\|m\| !m.target().starts_with("tao::"))`              |
-| Player Level and Pals count always 0                        | `decode_character_rawdata` double-wrapped `SaveParameter`, making properties unreachable at the expected JSON path | Flattened decoder output to `{"object": props}` directly; updated encoder to match              |
-| Level field not parsed from ByteProperty                    | `Level` is a `ByteProperty` with double-nested value (`{value:{type,value}}`), code only did one `.get("value")` | Changed extraction to `.get("value").get("value").as_u64()` to reach the inner numeric value   |
-| Last Seen always showing "Online now"                       | `GameTimeSaveData` was in the `is_skip_path` list, stored as raw blob instead of parsed JSON    | Removed from skip list so `RealDateTimeTicks` is parsed and `current_ticks` reads correctly     |
+| Issue                                                       | Root Cause                                                                                                                           | Resolution                                                                                                                |
+| ----------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------- |
+| Export freezes the UI                                       | ZIP compression ran on the main thread, blocking the event loop                                                                      | Moved to `tauri::async_runtime::spawn_blocking()` with progress events throttled to ≥ 2% changes                          |
+| Drag-and-drop for file import breaks player swap drag       | Tauri's `dragDropEnabled: true` intercepts ALL drag events via OLE handler, blocking HTML5 DnD                                       | Replaced HTML5 drag events with **pointer events** (`onPointerDown/Move/Up`) for player swaps                             |
+| Drag-dropped import doesn't detect existing world conflicts | `onDragDropEvent` closure captures stale `accountId` (empty deps `[]`)                                                               | Added `accountIdRef` (useRef) to always read the current value in async callbacks                                         |
+| Player names lost after world import                        | UI didn't refresh players/backups after import when `worldId` stayed the same                                                        | Explicitly re-fetch players, host slot, and backups after successful import                                               |
+| Nested folder detection for imports                         | Users often zip the world inside an extra parent folder                                                                              | `validate_world_folder` auto-detects and resolves same-name subfolder or single-subfolder nesting                         |
+| Backup didn't preserve world display name                   | `BackupSnapshot` didn't include `display_name`                                                                                       | Added `display_name` to snapshot with `#[serde(default)]` for backward compatibility                                      |
+| Console window flash every 3 seconds                        | `tasklist` process detection opened visible CMD windows in production                                                                | Added `CREATE_NO_WINDOW` flag (0x08000000) via `.creation_flags()` on Windows                                             |
+| White flash on app startup                                  | React takes a moment to mount, showing a blank white page                                                                            | Inline dark splash loader in `index.html` with spinner, fades out once React mounts                                       |
+| Missing permissions in production build                     | Tauri v2 capabilities not configured for events, webview, and dialog in production                                                   | Added `core:event`, `core:webview`, and `dialog` permissions to `capabilities/default.json`                               |
+| Exported ZIP too large                                      | All backup history included in export                                                                                                | All backup directories (`backup/` and `Players/backup/`) are fully excluded from the ZIP                                  |
+| Rescan doesn't detect deleted worlds                        | Rescan only refreshed accounts, didn't cascade re-fetch worlds/players/backups                                                       | Rescan now fully re-loads accounts → worlds → players → backups from disk                                                 |
+| P2P transfer times out between different networks           | Only STUN servers configured; STUN fails with symmetric NAT / CGNAT / mobile networks                                                | Integrated Metered.ca TURN relay with automatic credential fetching and 10-min caching                                    |
+| P2P fails silently with no relay candidates                 | Free Open Relay Project servers had invalid/expired credentials                                                                      | Replaced with Metered.ca API; each user configures their own account; Test TURN button to verify                          |
+| `json_to_sav` produces corrupted files                      | Size field written included the header bytes, causing the game to reject the file                                                    | Fixed `write_property_inner` to return only the data-only size; header written by the caller                              |
+| Host detection wrong after swaps                            | Config-based host ID drifted when `.sav` files were renamed                                                                          | Host is now always the player whose filename is slot `000…001`; no config needed                                          |
+| UI freezes during scanning / swapping                       | Heavy GVAS parsing ran on the Tauri main thread                                                                                      | All heavy commands (`get_players`, `swap_players`, `set_host_player`, `restore_backup`) use `spawn_blocking`              |
+| Unnecessary swaps when reordering many players              | Each adjacent drag was counted as a separate swap                                                                                    | Net-diff algorithm computes the minimum permutation difference using greedy cycle decomposition                           |
+| TAO window-manager warnings flooding console                | `tao` crate emitting debug messages about unhandled WM events                                                                        | Added `tauri_plugin_log` filter: `.filter(\|m\| !m.target().starts_with("tao::"))`                                        |
+| Player Level and Pals count always 0                        | `decode_character_rawdata` double-wrapped `SaveParameter`, making properties unreachable at the expected JSON path                   | Flattened decoder output to `{"object": props}` directly; updated encoder to match                                        |
+| Level field not parsed from ByteProperty                    | `Level` is a `ByteProperty` with double-nested value (`{value:{type,value}}`), code only did one `.get("value")`                     | Changed extraction to `.get("value").get("value").as_u64()` to reach the inner numeric value                              |
+| Last Seen always showing "Online now"                       | `GameTimeSaveData` was in the `is_skip_path` list, stored as raw blob instead of parsed JSON                                         | Removed from skip list so `RealDateTimeTicks` is parsed and `current_ticks` reads correctly                               |
+| Swapping players causes all pals to be lost                 | Old code swapped `PlayerUId` for ALL 1212 CSPM entries (including pals) and guild handles matched by `guid` instead of `instance_id` | Swap now reads `InstanceId` from each player `.sav` and matches only the 2 exact player entries in CSPM and guild handles |
+| P2P receiver gets console errors on large worlds            | `async` data handler processes chunks concurrently, causing out-of-order file writes                                                 | Receiver uses a sequential write queue (`writeChain`) so chunks are always appended in order                              |
+| P2P transfer slow for large worlds (~5 min for 300 MB)      | 64 KB chunks with base64 JSON wrapping (33% overhead) and polling-based back-pressure                                                | 256 KB binary chunks, `bufferedAmountLowThreshold` events, all backups stripped from export ZIP                           |
 
 ---
 
@@ -316,28 +324,28 @@ Double-click either installer to install the app. It will appear in your Start M
 
 All commands exposed via `tauri::generate_handler!`:
 
-| Command                                                 | Description                                                        |
-| ------------------------------------------------------- | ------------------------------------------------------------------ |
-| `get_accounts`                                          | List Steam account IDs from SaveGames folder                       |
-| `get_worlds` / `get_worlds_with_counts`                 | List worlds with player counts and display names                   |
-| `get_players`                                           | List players with name, level, pals, guild, last-seen (async)      |
-| `set_host_player`                                       | Swap a player into host slot `000…001` (modifies Level.sav + .savs)|
-| `swap_players`                                          | Swap two players' slot data (Level.sav + .sav files, with progress)|
-| `set_player_name` / `reset_player_names`                | Rename a player / reset all names to slot IDs                      |
-| `set_world_name` / `reset_world_name`                   | Set or clear a world's display name                                |
-| `create_backup` / `restore_backup`                      | Create or restore a full snapshot (async for restore)              |
-| `list_backups` / `delete_backup` / `delete_all_backups` | Manage backup history                                              |
-| `export_world`                                          | Export world as `.zip` (async, with progress events)               |
-| `validate_world_folder`                                 | Validate a folder structure as a valid Palworld world              |
-| `check_world_exists`                                    | Check if a world name already exists under an account              |
-| `import_world`                                          | Import a world folder (replace or copy, with backup merge)         |
-| `rescan_storage`                                        | Force re-scan of the SaveGames directory                           |
-| `is_palworld_running`                                   | Detect if Palworld is running (silent, no console window)          |
-| `export_world_to_temp`                                  | Export world to a temp ZIP for P2P sharing                         |
-| `get_file_size` / `read_file_chunk`                     | Read binary file data in chunks (for P2P transfer)                 |
-| `append_file_chunk_b64`                                 | Append base64-encoded chunk to a file (P2P receiver)               |
-| `get_temp_path` / `delete_temp_file`                    | Manage temporary files                                             |
-| `extract_zip_to_temp`                                   | Extract a received ZIP to a temp folder for validation             |
+| Command                                                 | Description                                                         |
+| ------------------------------------------------------- | ------------------------------------------------------------------- |
+| `get_accounts`                                          | List Steam account IDs from SaveGames folder                        |
+| `get_worlds` / `get_worlds_with_counts`                 | List worlds with player counts and display names                    |
+| `get_players`                                           | List players with name, level, pals, guild, last-seen (async)       |
+| `set_host_player`                                       | Swap a player into host slot `000…001` (modifies Level.sav + .savs) |
+| `swap_players`                                          | Swap two players' slot data (Level.sav + .sav files, with progress) |
+| `set_player_name` / `reset_player_names`                | Rename a player / reset all names to slot IDs                       |
+| `set_world_name` / `reset_world_name`                   | Set or clear a world's display name                                 |
+| `create_backup` / `restore_backup`                      | Create or restore a full snapshot (async for restore)               |
+| `list_backups` / `delete_backup` / `delete_all_backups` | Manage backup history                                               |
+| `export_world`                                          | Export world as `.zip` (async, with progress events)                |
+| `validate_world_folder`                                 | Validate a folder structure as a valid Palworld world               |
+| `check_world_exists`                                    | Check if a world name already exists under an account               |
+| `import_world`                                          | Import a world folder (replace or copy, with backup merge)          |
+| `rescan_storage`                                        | Force re-scan of the SaveGames directory                            |
+| `is_palworld_running`                                   | Detect if Palworld is running (silent, no console window)           |
+| `export_world_to_temp`                                  | Export world to a temp ZIP for P2P sharing (backups excluded)       |
+| `get_file_size` / `read_file_chunk`                     | Read binary file data in chunks (for P2P transfer)                  |
+| `append_file_chunk_b64`                                 | Append base64-encoded chunk to a file (P2P receiver)                |
+| `get_temp_path` / `delete_temp_file`                    | Manage temporary files                                              |
+| `extract_zip_to_temp`                                   | Extract a received ZIP to a temp folder for validation              |
 
 ---
 

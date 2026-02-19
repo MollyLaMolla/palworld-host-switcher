@@ -20,7 +20,7 @@ import {
 } from "./palworldService";
 
 const PEER_PREFIX = "palhost-";
-const CHUNK_SIZE = 65536; // 64KB per chunk
+const CHUNK_SIZE = 262144; // 256KB per chunk (4× faster, fewer IPC round-trips)
 const CODE_CHARS = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // no I,O,0,1
 
 /* ── Metered TURN API ──────────────────────────────── */
@@ -303,15 +303,6 @@ function uint8ToBase64(arr: Uint8Array): string {
   return btoa(binary);
 }
 
-function base64ToUint8(b64: string): Uint8Array {
-  const binary = atob(b64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i++) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
-}
-
 export type P2PStatus =
   | "idle"
   | "preparing"
@@ -508,6 +499,14 @@ export async function startSending(
       conn.on("open", async () => {
         try {
           await sendFileViaConnection(conn, zipPath, callbacks);
+
+          // Wait for receiver to acknowledge it processed everything
+          callbacks.onStatus(
+            "transferring",
+            "Waiting for receiver to confirm…",
+          );
+          await waitForReceiverAck(conn, 120_000);
+
           callbacks.onStatus("done", "Transfer complete!");
           callbacks.onProgress(100);
           resolve();
@@ -518,8 +517,8 @@ export async function startSending(
           );
           reject(e);
         } finally {
-          // small delay before cleanup so the last messages are flushed
-          setTimeout(() => cancelP2P(), 2000);
+          // Longer delay before cleanup so the receiver finishes any remaining work
+          setTimeout(() => cancelP2P(), 5000);
         }
       });
 
@@ -543,7 +542,7 @@ async function sendFileViaConnection(
   callbacks.onStatus("transferring", "Sending file…");
   callbacks.onProgress(0);
 
-  // Send metadata
+  // Send metadata as JSON string
   conn.send(
     JSON.stringify({
       type: "meta",
@@ -559,30 +558,108 @@ async function sendFileViaConnection(
   for (let i = 0; i < totalChunks; i++) {
     const offset = i * CHUNK_SIZE;
     const chunkData = await readFileChunk(zipPath, offset, CHUNK_SIZE);
-    const bytes = new Uint8Array(chunkData);
-    const b64 = uint8ToBase64(bytes);
+    // Send raw binary — no base64 encoding needed (saves ~33% bandwidth)
+    conn.send(new Uint8Array(chunkData));
 
-    conn.send(JSON.stringify({ type: "chunk", index: i, data: b64 }));
-
-    // Back-pressure: wait if DataChannel buffer is too full
+    // Back-pressure: wait if DataChannel buffer is too full (4MB threshold)
     const dc = (conn as unknown as { dataChannel?: RTCDataChannel })
       .dataChannel;
-    if (dc && dc.bufferedAmount > 2 * 1024 * 1024) {
-      await new Promise<void>((resolve) => {
-        const check = () => {
-          if (!dc || dc.bufferedAmount < 512 * 1024) resolve();
-          else setTimeout(check, 50);
-        };
-        check();
-      });
+    if (dc && dc.bufferedAmount > 4 * 1024 * 1024) {
+      await drainBuffer(dc, 1024 * 1024);
     }
 
     const pct = ((i + 1) / totalChunks) * 100;
     callbacks.onProgress(pct);
   }
 
+  // Wait for DataChannel send-buffer to drain before signaling done
+  const dcFinal = (conn as unknown as { dataChannel?: RTCDataChannel })
+    .dataChannel;
+  if (dcFinal && dcFinal.bufferedAmount > 0) {
+    await drainBuffer(dcFinal, 0);
+  }
+
   // Send done signal
   conn.send(JSON.stringify({ type: "done" }));
+}
+
+/**
+ * Wait until DataChannel bufferedAmount drops to the target threshold.
+ * Uses the efficient bufferedAmountLowThreshold event with a fallback poll.
+ */
+function drainBuffer(dc: RTCDataChannel, target: number): Promise<void> {
+  return new Promise<void>((resolve) => {
+    if (dc.bufferedAmount <= target) {
+      resolve();
+      return;
+    }
+    const prev = dc.bufferedAmountLowThreshold;
+    dc.bufferedAmountLowThreshold = target;
+
+    let fallback: ReturnType<typeof setInterval> | null = null;
+    const cleanup = () => {
+      dc.removeEventListener("bufferedamountlow", onLow);
+      dc.bufferedAmountLowThreshold = prev;
+      if (fallback) clearInterval(fallback);
+    };
+    const onLow = () => {
+      cleanup();
+      resolve();
+    };
+    dc.addEventListener("bufferedamountlow", onLow);
+    // Fallback polling in case the event doesn't fire (some browsers)
+    fallback = setInterval(() => {
+      if (dc.bufferedAmount <= target) {
+        cleanup();
+        resolve();
+      }
+    }, 100);
+  });
+}
+
+/**
+ * Wait for the receiver to send back an { type: "ack" } message.
+ * This ensures the receiver has actually written all chunks to disk
+ * and processed the "done" signal before the sender tears down the connection.
+ */
+function waitForReceiverAck(
+  conn: ReturnType<Peer["connect"]>,
+  timeoutMs: number,
+): Promise<void> {
+  return new Promise<void>((resolve) => {
+    const timeout = setTimeout(() => {
+      cleanup();
+      // Resolve anyway — data was sent, ack may have been lost
+      resolve();
+    }, timeoutMs);
+
+    const onData = (raw: unknown) => {
+      try {
+        const msg = JSON.parse(raw as string);
+        if (msg.type === "ack") {
+          cleanup();
+          resolve();
+        }
+      } catch {
+        // ignore non-JSON messages
+      }
+    };
+
+    const onClose = () => {
+      cleanup();
+      // Connection closed before ack — resolve anyway since data was sent
+      resolve();
+    };
+
+    const cleanup = () => {
+      clearTimeout(timeout);
+      conn.off("data", onData);
+      conn.off("close", onClose);
+    };
+
+    conn.on("data", onData);
+    conn.on("close", onClose);
+  });
 }
 
 /* ── RECEIVER ────────────────────────────────────────── */
@@ -602,6 +679,14 @@ export async function startReceiving(
 
   return new Promise<string>((resolve, reject) => {
     let transferStarted = false;
+    let settled = false;
+
+    const settle = (type: "resolve" | "reject", value: string | Error) => {
+      if (settled) return;
+      settled = true;
+      if (type === "resolve") resolve(value as string);
+      else reject(value);
+    };
 
     const peer = new Peer(receiverId, {
       debug: 0,
@@ -619,61 +704,109 @@ export async function startReceiving(
       let totalSize = 0;
       let receivedBytes = 0;
       let tempPath = "";
+      // Sequential write queue — prevents race conditions from concurrent async handlers
+      let writeChain = Promise.resolve();
 
       conn.on("open", () => {
         callbacks.onStatus("connecting", "Connected! Waiting for file…");
       });
 
-      conn.on("data", async (raw) => {
-        try {
-          const msg = JSON.parse(raw as string);
+      // NOT async — we queue work instead of awaiting inside the handler
+      conn.on("data", (raw) => {
+        // JSON string → control message; binary → chunk data
+        if (typeof raw === "string") {
+          try {
+            const msg = JSON.parse(raw);
 
-          if (msg.type === "meta") {
-            totalSize = msg.totalSize;
-            tempPath = destZipPath;
-            // Clear any previous file at destination
-            await deleteTempFile(tempPath).catch(() => {});
-            callbacks.onStatus("transferring", "Receiving file…");
-            callbacks.onProgress(0);
-            transferStarted = true;
-          } else if (msg.type === "chunk") {
-            const b64: string = msg.data;
+            if (msg.type === "meta") {
+              totalSize = msg.totalSize;
+              tempPath = destZipPath;
+              // Clear any previous file at destination (queued)
+              writeChain = writeChain.then(() =>
+                deleteTempFile(tempPath).catch(() => {}),
+              );
+              callbacks.onStatus("transferring", "Receiving file…");
+              callbacks.onProgress(0);
+              transferStarted = true;
+            } else if (msg.type === "done") {
+              // Wait for ALL queued chunk writes to finish, then extract
+              writeChain
+                .then(async () => {
+                  callbacks.onProgress(100);
+                  callbacks.onStatus("extracting", "Extracting ZIP…");
+
+                  // Send ack BEFORE extraction so sender knows data arrived
+                  try {
+                    conn.send(JSON.stringify({ type: "ack" }));
+                  } catch {
+                    // Connection may already be closing — not critical
+                  }
+
+                  const extractedFolder = await extractZipToTemp(tempPath);
+                  const validated = await validateWorldFolder(extractedFolder);
+
+                  callbacks.onStatus("done", "World received!");
+                  callbacks.onComplete?.(validated.path);
+
+                  setTimeout(() => cancelP2P(), 2000);
+                  settle("resolve", validated.path);
+                })
+                .catch((e) => {
+                  callbacks.onStatus(
+                    "error",
+                    `Receive error: ${e instanceof Error ? e.message : e}`,
+                  );
+                  cancelP2P();
+                  settle(
+                    "reject",
+                    e instanceof Error ? e : new Error(String(e)),
+                  );
+                });
+            }
+          } catch (e) {
+            callbacks.onStatus(
+              "error",
+              `Receive error: ${e instanceof Error ? e.message : e}`,
+            );
+            cancelP2P();
+            settle("reject", e instanceof Error ? e : new Error(String(e)));
+          }
+        } else {
+          // Binary chunk data — extract Uint8Array robustly
+          let bytes: Uint8Array;
+          if (raw instanceof ArrayBuffer) {
+            bytes = new Uint8Array(raw);
+          } else if (raw instanceof Uint8Array) {
+            bytes = raw;
+          } else if (ArrayBuffer.isView(raw)) {
+            bytes = new Uint8Array(
+              (raw as ArrayBufferView).buffer,
+              (raw as ArrayBufferView).byteOffset,
+              (raw as ArrayBufferView).byteLength,
+            );
+          } else {
+            // Unexpected type — skip
+            return;
+          }
+
+          const chunkLen = bytes.byteLength;
+
+          // Queue the write so chunks are processed sequentially
+          writeChain = writeChain.then(async () => {
+            // Convert to base64 for Tauri IPC (local-only, fast)
+            const b64 = uint8ToBase64(bytes);
             await appendFileChunkB64(tempPath, b64);
-            const chunkBytes = base64ToUint8(b64).length;
-            receivedBytes += chunkBytes;
+            receivedBytes += chunkLen;
             const pct = Math.min((receivedBytes / totalSize) * 100, 99);
             callbacks.onProgress(pct);
-          } else if (msg.type === "done") {
-            callbacks.onProgress(100);
-            callbacks.onStatus("extracting", "Extracting ZIP…");
-
-            // Extract the received ZIP
-            const extractedFolder = await extractZipToTemp(tempPath);
-            // Validate it
-            const validated = await validateWorldFolder(extractedFolder);
-
-            // ZIP stays at the user-chosen destination (not deleted)
-
-            callbacks.onStatus("done", "World received!");
-            callbacks.onComplete?.(validated.path);
-
-            setTimeout(() => cancelP2P(), 1000);
-            resolve(validated.path);
-          }
-        } catch (e) {
-          callbacks.onStatus(
-            "error",
-            `Receive error: ${e instanceof Error ? e.message : e}`,
-          );
-          cancelP2P();
-          reject(e);
+          });
         }
       });
 
       conn.on("error", (err) => {
         callbacks.onStatus("error", `Connection error: ${err}`);
         cancelP2P();
-        reject(err);
+        settle("reject", err instanceof Error ? err : new Error(String(err)));
       });
 
       conn.on("close", () => {
@@ -682,7 +815,7 @@ export async function startReceiving(
             "error",
             "Connection closed before transfer completed.",
           );
-          reject(new Error("Connection closed prematurely"));
+          settle("reject", new Error("Connection closed prematurely"));
         }
       });
     });
@@ -695,15 +828,15 @@ export async function startReceiving(
         callbacks.onStatus("error", `Error: ${msg}`);
       }
       cancelP2P();
-      reject(err);
+      settle("reject", err instanceof Error ? err : new Error(msg));
     });
 
     // Timeout
     setTimeout(() => {
-      if (!transferStarted) {
+      if (!transferStarted && !settled) {
         callbacks.onStatus("error", "Connection timeout.");
         cancelP2P();
-        reject(new Error("Timeout"));
+        settle("reject", new Error("Timeout"));
       }
     }, 120000);
   });
